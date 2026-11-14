@@ -230,6 +230,7 @@ class BudsWorker(threading.Thread):
 class App(QWidget):
     sig_disconnected = Signal(bool, str)
     sig_start_worker = Signal(str)
+    sig_audio_missing = Signal(str)
 
     def __init__(self, demo: bool = False):
         super().__init__()
@@ -249,6 +250,8 @@ class App(QWidget):
         self._full_name = "未连接"
         self.last_addr = ""
         self._retry_left = 1
+        self._disconnect_hint_shown = False
+        self._audio_checked = False
         self.settings = QSettings("OppoEncoCC", "controller")
         # 条状形态里显示哪些东西（可自定义）
         self.bar_items = {"anc": True, "eq": True, "battery": True,
@@ -312,6 +315,7 @@ class App(QWidget):
             self.restoreGeometry(geo)
         self.sig_disconnected.connect(self._on_disconnected)
         self.sig_start_worker.connect(self._start_worker)
+        self.sig_audio_missing.connect(self._on_audio_missing)
         self.apply_theme()
         if self.settings.value("compact", False, type=bool):
             self.toggle_compact()       # 恢复上次的条状形态
@@ -954,6 +958,22 @@ class App(QWidget):
                 and not (self.worker and self.worker.is_alive()):
             QTimer.singleShot(500, self._auto_connect)
 
+    def _check_audio(self):
+        """连上后确认系统里仍有该耳机的音频端点，缺失则提示恢复方法。"""
+        name = self.profile.name.split("（")[0][:18]
+        has = btwin.has_audio_endpoint(name)
+        logs.get("app").info("音频端点检查 %s -> %s", name, has)
+        if has is False:
+            self.sig_audio_missing.emit(name)
+
+    def _on_audio_missing(self, name: str):
+        QMessageBox.warning(
+            self, "耳机已连接但没有声音？",
+            f"系统里找不到「{name}」的音频端点，说明它的音频服务被卸载了。\n\n"
+            "恢复方法（任选其一，约 30 秒）：\n"
+            "1. Windows 设置 → 蓝牙和设备 → 移除该耳机，再重新配对；\n"
+            "2. 重启电脑后重新连接耳机。")
+
     def _reconnect(self, addr: str):
         self.btn_connect.setText("连接中…")
         self.btn_connect.setEnabled(False)
@@ -964,9 +984,19 @@ class App(QWidget):
     def _on_disconnected(self, ok: bool, msg: str):
         self.lbl_state.setToolTip(msg)
         if ok:
+            self.lbl_state.setText("已断开")
             return
-        self.lbl_state.setText("断开失败")
-        QMessageBox.information(self, "断开失败", msg)
+        # 适配器不支持强制断开：控制通道已关，链路仍在
+        self.lbl_state.setText("已断开控制通道")
+        if not self._disconnect_hint_shown:
+            self._disconnect_hint_shown = True
+            QMessageBox.information(
+                self, "控制通道已断开",
+                "已停止控制通道。\n\n"
+                "该蓝牙适配器不支持程序化断开链路；如需彻底断开，"
+                "请在 Windows 蓝牙设置里手动断开。\n\n"
+                "（旧版通过停用音频服务来断开，会让系统卸载耳机音频端点，"
+                "导致连上后没声音，该做法已移除。）")
 
     def _auto_connect(self):
         addr = self.combo_dev.currentData()
@@ -1093,6 +1123,10 @@ class App(QWidget):
             self._sync_bar()
             if self.worker:
                 self.worker.sync_feature_states()
+            if not self._audio_checked:
+                self._audio_checked = True
+                threading.Thread(target=self._check_audio,
+                                 daemon=True).start()
             self.adjust_height()
         elif topic == "disconnected_manual":
             self.btn_connect.setText("连接")

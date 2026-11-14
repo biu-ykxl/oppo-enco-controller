@@ -184,9 +184,6 @@ SERVICE_DISABLE = 0
 SERVICE_ENABLE = 1
 
 
-_DISABLED_SERVICES: dict[str, list[str]] = {}
-
-
 def _addr_to_int(addr: str) -> int:
     return int(addr.replace(":", "").replace("-", ""), 16)
 
@@ -261,34 +258,20 @@ def _still_connected(lib, hradio, addr: str) -> bool:
 
 
 def disconnect_device(addr: str) -> tuple[bool, str]:
-    """真正断开该设备的链路（保留配对）。
+    """尝试强制断开经典蓝牙链路（保留配对、不动服务）。
 
-    只停用 A2DP 服务即可让系统释放链路（实测 3.1s，比逐个停用 3 项快 3 倍），
-    其余服务保持启用 —— 这样重连时不会因为「某些服务仍是停用状态」而连上掉线。
-    若停 A2DP 后链路仍在，再依次停 HFP/AVRCP 兜底。
+    重要：**不要**用 BluetoothSetServiceState 停 A2DP 来断开 —— 实测会让
+    Windows 卸载该设备的音频端点（"耳机 (XXX)" 从设备管理器消失），之后即使
+    重新连接也没有声音，必须移除设备重新配对才能恢复。所以这里只用
+    IOCTL_BTH_DISCONNECT_DEVICE，驱动不支持时如实返回失败，由调用方决定是否
+    仅关闭控制通道。
     """
     if not IS_WINDOWS:
         return False, "仅 Windows 支持"
 
-    disabled: list[str] = []
-
     def run(lib, hradio):
         if not _still_connected(lib, hradio, addr):
             return True, "本就未连接"
-        info = _device_info(lib, hradio, addr)
-        if info is None:
-            return False, "读不到设备信息（可能未配对）"
-
-        for guid in (GUID_A2DP, GUID_HFP, GUID_AVRCP):
-            if _set_service(lib, hradio, info, guid, SERVICE_DISABLE) == 0:
-                disabled.append(guid)
-            # 每次停用后立刻看链路是否已释放（停用调用本身会阻塞约 3s）
-            for _ in range(10):
-                if not _still_connected(lib, hradio, addr):
-                    return True, "已断开"
-                time.sleep(0.06)
-
-        # 兜底：部分驱动接受强制断开 IOCTL
         try:
             addr_val = ctypes.c_ulonglong(_addr_to_int(addr))
             returned = wintypes.DWORD(0)
@@ -297,46 +280,56 @@ def disconnect_device(addr: str) -> tuple[bool, str]:
                 wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
                 wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
-            k32.DeviceIoControl(hradio, KSPROP_DISCONNECT_IOCTL,
-                                ctypes.byref(addr_val), 8, None, 0,
-                                ctypes.byref(returned), None)
-        except Exception:
-            pass
-        for _ in range(15):
-            if not _still_connected(lib, hradio, addr):
+            ok = k32.DeviceIoControl(hradio, KSPROP_DISCONNECT_IOCTL,
+                                     ctypes.byref(addr_val), 8, None, 0,
+                                     ctypes.byref(returned), None)
+            if ok:
                 return True, "已断开"
-            time.sleep(0.08)
-        return False, "停用了服务但链路仍未断开"
+            err = k32.GetLastError()
+        except Exception as exc:                     # noqa: BLE001
+            return False, f"断开失败：{exc}"
+        # 驱动不支持该 IOCTL（本机为 WinError 50）：保持链路不动，交给用户
+        return False, f"此适配器不支持强制断开（WinError {err}），已仅关闭控制通道"
 
-    ok, msg = _with_radio(run)
-    if ok and disabled:
-        _DISABLED_SERVICES[addr.upper()] = list(disabled)
-    return ok, msg
+    return _with_radio(run)
 
 
 def connect_device(addr: str) -> tuple[bool, str]:
-    """触发回连：重新启用之前停用的服务（默认只有 A2DP）。"""
+    """仅查询链路状态。**不再通过服务开关触发回连**（会破坏音频端点）。"""
     if not IS_WINDOWS:
         return False, "仅 Windows 支持"
+    if is_connected(addr):
+        return True, "链路已在"
+    return False, "链路未建立，请先在 Windows 蓝牙设置中连接"
 
-    def run(lib, hradio):
-        info = _device_info(lib, hradio, addr)
-        if info is None:
-            return False, "读不到设备信息（可能未配对）"
-        guids = _DISABLED_SERVICES.get(addr.upper()) or [GUID_A2DP]
-        if not _DISABLED_SERVICES.get(addr.upper()):
-            # 没记录也无所谓：先关再开 A2DP 一样能触发回连
-            _set_service(lib, hradio, info, GUID_A2DP, SERVICE_DISABLE)
-        ok = False
-        for guid in guids:
-            if _set_service(lib, hradio, info, guid, SERVICE_ENABLE) == 0:
-                ok = True
-        if ok:
-            _DISABLED_SERVICES.pop(addr.upper(), None)
-            return True, "已发起连接"
-        return False, "连接失败（服务状态未改变）"
 
-    return _with_radio(run)
+def has_audio_endpoint(name_hint: str, timeout: float = 20.0) -> bool | None:
+    """检查该设备在系统里是否还有音频端点（True/False/None=无法判断）。
+
+    A2DP 服务被异常停用后端点会被卸载，表现就是「连上了但没声音」。
+    """
+    if not IS_WINDOWS or not name_hint:
+        return None
+    import subprocess
+    hint = name_hint.replace("'", "")
+    ps = ("Get-PnpDevice -Class AudioEndpoint | Where-Object "
+          "{ $_.FriendlyName -like '*" + hint + "*' } | "
+          "Select-Object -First 1 -ExpandProperty FriendlyName")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, timeout=timeout)
+        raw = out.stdout or b""
+        for enc in ("utf-8", "gbk", "mbcs"):
+            try:
+                text = raw.decode(enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            text = raw.decode("utf-8", "replace")
+        return bool(text.strip())
+    except Exception:
+        return None
 
 
 def is_connected(addr: str) -> bool:
