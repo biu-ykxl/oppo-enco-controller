@@ -13,17 +13,20 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
 
-from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget)
+    QMenu, QMessageBox, QPushButton, QVBoxLayout, QWidget)
 
-from oppo import audioinfo, btwin
-from oppo.devices import GENERIC, looks_like_oppo, profile_by_product_id
+from oppo import audioinfo, btwin, logs
+from oppo.devices import (GENERIC, looks_like_supported,
+                          profile_by_product_id)
 from oppo.protocol import (FEATURE_GAME_MODE, FEATURE_HIGH_QUALITY,
                            HQ_OFF, HQ_ON)
 from oppo.transport import Buds, TransportError
@@ -52,6 +55,7 @@ class BudsWorker(threading.Thread):
         self.bridge = self._Bridge()
         self.bridge.hide()
         self.product_id: str | None = None
+        self.fast_anc = False        # Air 系列等：跳过回读校验
         self._cmd_lock = threading.Lock()
 
     def post(self, fn):
@@ -89,16 +93,21 @@ class BudsWorker(threading.Thread):
         try:
             self.product_id = self.buds.info().get("product_id")
             self._emit("connected", self.product_id or "")
+            # 先问设备自己支不支持这些档位，白名单没收录的型号（realme 等）靠这个
+            modes = self.buds.anc_modes()
+            if modes:
+                self._emit("anc_modes", modes)
             self._poll_once(full=True)
             caps = self.buds.notify_caps()
             events = [e for e in (1, 2, 3, 5, 0xF2) if not caps or e in caps]
             if events:
                 self.buds.register_notify(events)
             while not self.stop_flag.is_set():
-                for _ in range(50):
+                # 4s 一轮；拆成 0.05s 步进，命令来了能立刻抢占
+                for _ in range(80):
                     if self.stop_flag.is_set():
                         break
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                 if self.stop_flag.is_set():
                     break
                 self._poll_once()
@@ -114,7 +123,7 @@ class BudsWorker(threading.Thread):
         b = self.buds
         try:
             with self._cmd_lock:
-                batt = b.battery()
+                batt = b.battery(wait=1.0)
                 if batt:
                     self._emit("battery", batt)
                 if full:
@@ -127,7 +136,7 @@ class BudsWorker(threading.Thread):
                     if eq is not None:
                         self._emit("event", {"event": "eq_set", "index": eq})
                     self._emit("eq_catalog", b.eq_catalog())
-                events = b.read_events(0.8, self.product_id)
+                events = b.read_events(0.35, self.product_id)
             for ev in events:
                 self._emit("event", ev)
         except TransportError as e:
@@ -137,10 +146,18 @@ class BudsWorker(threading.Thread):
 
     # ---- 命令 ---------------------------------------------------------------
     def anc_set(self, index: int):
+        """切换降噪。
+
+        快路径（Air 系列 / 未知型号）：发完即认为成功，不等待回读 ——
+        这些固件回读要 1~3 秒，等待会让切换手感明显发滞。
+        慢路径（Free4 等）：短等待回读确认，读不到就保留乐观状态。
+        """
         def _do(b):
             b.anc_set(index)
-            time.sleep(0.35)
-            got = b.anc_query()          # ack 不算数，回读为准
+            if self.fast_anc:
+                self._emit("event", {"event": "noise_mode", "index": index})
+                return
+            got = b.anc_query(wait=0.7)   # ack 不算数，回读为准（但别等太久）
             self._emit("event", {"event": "noise_mode",
                                  "index": got if got is not None else index})
         self.post(_do)
@@ -179,6 +196,13 @@ class App(QWidget):
         self.ring_on = False
         self.feature_state = {"game": False, "hq": False}
         self._drag: QPoint | None = None
+        self.compact = False
+        self.verbose = False
+        self._cur_mode = None
+        self.settings = QSettings("OppoEncoCC", "controller")
+        # 条状形态里显示哪些东西（可自定义）
+        self.bar_items = {"anc": True, "battery": True,
+                          "game": False, "find": False}
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -191,10 +215,14 @@ class App(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.root)
 
-        lay = QVBoxLayout(self.root)
+        root_lay = QVBoxLayout(self.root)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
+
+        self.panel = QWidget()
+        lay = QVBoxLayout(self.panel)
         lay.setContentsMargins(22, 18, 22, 16)
         lay.setSpacing(12)
-
         lay.addLayout(self._build_header())
         lay.addWidget(self._sep())
         lay.addWidget(self._build_device_row())
@@ -208,7 +236,15 @@ class App(QWidget):
         lay.addStretch(1)
         lay.addWidget(self._build_footer())
 
+        self.bar = self._build_bar()
+        self.bar.setVisible(False)
+        root_lay.addWidget(self.panel)
+        root_lay.addWidget(self.bar)
+
+        self._load_settings()
         self.apply_theme()
+        if self.settings.value("compact", False, type=bool):
+            self.toggle_compact()       # 恢复上次的条状形态
 
         if demo:
             QTimer.singleShot(150, self._load_demo)
@@ -233,6 +269,16 @@ class App(QWidget):
         row.addWidget(self.lbl_state)
         row.addStretch(1)
 
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setObjectName("icon")
+        self.btn_settings.setToolTip("设置 / 日志")
+        self.btn_settings.setCursor(Qt.PointingHandCursor)
+        self.btn_settings.clicked.connect(self.open_settings)
+        self.btn_min = QPushButton("▾")
+        self.btn_min.setObjectName("icon")
+        self.btn_min.setToolTip("最小化为条状")
+        self.btn_min.setCursor(Qt.PointingHandCursor)
+        self.btn_min.clicked.connect(self.toggle_compact)
         self.btn_theme = QPushButton("☀")
         self.btn_theme.setObjectName("icon")
         self.btn_theme.setToolTip("切换深浅色")
@@ -248,6 +294,8 @@ class App(QWidget):
         self.btn_close.setObjectName("icon")
         self.btn_close.setCursor(Qt.PointingHandCursor)
         self.btn_close.clicked.connect(self.close)
+        row.addWidget(self.btn_settings)
+        row.addWidget(self.btn_min)
         row.addWidget(self.btn_theme)
         row.addWidget(self.btn_pin)
         row.addWidget(self.btn_close)
@@ -396,6 +444,193 @@ class App(QWidget):
         col.addWidget(self.lbl_pid)
         return w
 
+    # ---- 条状形态 -----------------------------------------------------------
+    def _build_bar(self):
+        w = QWidget()
+        w.setObjectName("bar")
+        row = QHBoxLayout(w)
+        row.setContentsMargins(14, 9, 10, 9)
+        row.setSpacing(8)
+
+        self.bar_dot = QLabel("●")
+        self.bar_dot.setObjectName("dot")
+        self.bar_name = QLabel("未连接")
+        self.bar_name.setObjectName("barname")
+        self.bar_name.setFixedWidth(108)
+
+        self.btn_bar_anc = QPushButton("降噪 —")
+        self.btn_bar_anc.setObjectName("pillMini")
+        self.btn_bar_anc.setCursor(Qt.PointingHandCursor)
+        self.btn_bar_anc.setToolTip("点击循环切换降噪模式")
+        self.btn_bar_anc.clicked.connect(self.cycle_anc)
+
+        self.bar_batt = QLabel("")
+        self.bar_batt.setObjectName("battmini")
+
+        self.btn_bar_game = QPushButton("🎮")
+        self.btn_bar_game.setObjectName("icon")
+        self.btn_bar_game.setCheckable(True)
+        self.btn_bar_game.setToolTip("游戏模式")
+        self.btn_bar_game.setCursor(Qt.PointingHandCursor)
+        self.btn_bar_game.toggled.connect(self.on_bar_game)
+
+        self.btn_bar_find = QPushButton("🔊")
+        self.btn_bar_find.setObjectName("icon")
+        self.btn_bar_find.setToolTip("查找耳机")
+        self.btn_bar_find.setCursor(Qt.PointingHandCursor)
+        self.btn_bar_find.clicked.connect(self.on_find)
+
+        self.btn_expand = QPushButton("▴")
+        self.btn_expand.setObjectName("icon")
+        self.btn_expand.setToolTip("展开完整面板")
+        self.btn_expand.setCursor(Qt.PointingHandCursor)
+        self.btn_expand.clicked.connect(self.toggle_compact)
+
+        self.btn_bar_close = QPushButton("✕")
+        self.btn_bar_close.setObjectName("icon")
+        self.btn_bar_close.setCursor(Qt.PointingHandCursor)
+        self.btn_bar_close.clicked.connect(self.close)
+
+        row.addWidget(self.bar_dot)
+        row.addWidget(self.bar_name)
+        row.addWidget(self.btn_bar_anc, 1)
+        row.addWidget(self.bar_batt)
+        row.addWidget(self.btn_bar_game)
+        row.addWidget(self.btn_bar_find)
+        row.addWidget(self.btn_expand)
+        row.addWidget(self.btn_bar_close)
+        return w
+
+    def toggle_compact(self):
+        self.compact = not self.compact
+        self.panel.setVisible(not self.compact)
+        self.bar.setVisible(self.compact)
+        if self.compact:
+            self.setFixedWidth(470)     # 条状比面板稍宽，够放降噪+电量
+            self.resize(470, 58)
+            self._sync_bar()
+        else:
+            self.setFixedWidth(432)
+            self._fit_panel()
+        self._save_settings()
+
+    def _fit_panel(self):
+        self.panel.adjustSize()
+        self.resize(self.width(), max(660, self.panel.sizeHint().height()))
+
+    def cycle_anc(self):
+        """条状形态：一个按钮轮流切换降噪档位。"""
+        modes = [m["index"] for m in self.profile.anc]
+        if not modes:
+            return
+        try:
+            i = modes.index(self._cur_mode)
+        except ValueError:
+            i = -1
+        nxt = modes[(i + 1) % len(modes)]
+        self.on_anc(nxt)
+
+    def _sync_bar(self):
+        """把连接状态与当前档位同步到条状形态。"""
+        if not hasattr(self, "btn_bar_anc"):
+            return
+        name = self.lbl_title.text() if self.lbl_state.text().startswith("已连接") else "未连接"
+        # 右侧图标越少，名字留的空间越大
+        extra_icons = int(self.bar_items["game"]) + int(self.bar_items["find"])
+        avail = 150 - extra_icons * 28
+        self.bar_name.setFixedWidth(avail)
+        from PySide6.QtGui import QFontMetrics
+        self.bar_name.setText(QFontMetrics(self.bar_name.font()).elidedText(
+            name, Qt.ElideRight, avail - 4))
+        self.bar_name.setToolTip(name)
+        self.bar_dot.setProperty("on", name != "未连接")
+        self.bar_dot.style().unpolish(self.bar_dot)
+        self.bar_dot.style().polish(self.bar_dot)
+        if self._cur_mode is not None:
+            label = self.profile.anc_label(self._cur_mode)
+            self.btn_bar_anc.setText(label)
+            self.btn_bar_anc.setToolTip(f"降噪：{label}（点击切换下一档）")
+        else:
+            self.btn_bar_anc.setText("降噪 —")
+            self.btn_bar_anc.setToolTip("点击切换降噪模式")
+        self.btn_bar_anc.setVisible(self.bar_items["anc"])
+        self.bar_batt.setVisible(self.bar_items["battery"])
+        self.btn_bar_game.setVisible(self.bar_items["game"])
+        self.btn_bar_find.setVisible(self.bar_items["find"] and self.profile.find)
+
+    def on_bar_game(self, on: bool):
+        if self.sw_game.isChecked() != on:
+            self.sw_game.setChecked(on)
+
+    # ---- 设置菜单 -----------------------------------------------------------
+    def open_settings(self):
+        m = QMenu(self)
+        sub = m.addMenu("条状形态显示")
+        for key, label in (("anc", "降噪切换"), ("battery", "电量"),
+                           ("game", "游戏模式"), ("find", "查找耳机")):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(self.bar_items[key])
+            act.toggled.connect(lambda on, k=key: self.set_bar_item(k, on))
+            sub.addAction(act)
+        m.addSeparator()
+        act_log = QAction("详细协议日志", self)
+        act_log.setCheckable(True)
+        act_log.setChecked(self.verbose)
+        act_log.toggled.connect(self.set_verbose)
+        m.addAction(act_log)
+        m.addAction("打开日志文件夹", self.open_log_folder)
+        act_dark = QAction("深色模式", self)
+        act_dark.setCheckable(True)
+        act_dark.setChecked(self.dark)
+        act_dark.toggled.connect(lambda on: self.set_dark(on))
+        m.addAction(act_dark)
+        m.exec(self.btn_settings.mapToGlobal(
+            self.btn_settings.rect().bottomLeft()))
+
+    def set_bar_item(self, key: str, on: bool):
+        self.bar_items[key] = on
+        self._sync_bar()
+        self._save_settings()
+
+    def set_verbose(self, on: bool):
+        self.verbose = on
+        logs.set_verbose(on)
+        logs.get("app").info("详细协议日志 %s", "开启" if on else "关闭")
+        self._save_settings()
+
+    def open_log_folder(self):
+        path = logs.log_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(path)          # noqa: S606 - Windows 打开资源管理器
+        except OSError:
+            QMessageBox.information(self, "日志目录", str(path))
+
+    def set_dark(self, on: bool):
+        if self.dark != on:
+            self.dark = on
+            self.apply_theme()
+            self._save_settings()
+
+    # ---- 持久化 -------------------------------------------------------------
+    def _load_settings(self):
+        st = self.settings
+        self.dark = st.value("dark", True, type=bool)
+        self.verbose = st.value("verbose", False, type=bool)
+        for key in self.bar_items:
+            self.bar_items[key] = st.value(f"bar/{key}",
+                                           self.bar_items[key], type=bool)
+        logs.setup(self.verbose)
+
+    def _save_settings(self):
+        st = self.settings
+        st.setValue("dark", self.dark)
+        st.setValue("verbose", self.verbose)
+        st.setValue("compact", self.compact)
+        for key, val in self.bar_items.items():
+            st.setValue(f"bar/{key}", val)
+
     # ---- 主题 ---------------------------------------------------------------
     def apply_theme(self):
         self.p = palette(self.dark)
@@ -410,6 +645,9 @@ class App(QWidget):
             sw.p = self.p
             sw.update()
         self.btn_theme.setText("☀" if self.dark else "🌙")
+        if hasattr(self, "bar_dot"):
+            self.bar_dot.style().unpolish(self.bar_dot)
+            self.bar_dot.style().polish(self.bar_dot)
 
     def toggle_pin(self):
         on = self.btn_pin.isChecked()
@@ -442,7 +680,7 @@ class App(QWidget):
         self.combo_dev.addItem("选择耳机…", "")
         found = 0
         for d in devices:
-            if looks_like_oppo(d["name"]):
+            if looks_like_supported(d["name"]):
                 tag = "  ·  已连接" if d["connected"] else ""
                 self.combo_dev.addItem(f"{d['name']}{tag}", d["address"])
                 found += 1
@@ -482,7 +720,10 @@ class App(QWidget):
     # ---- 事件 ---------------------------------------------------------------
     def on_worker_event(self, topic: str, data):
         if topic == "connected":
-            self.profile = profile_by_product_id(data or None)
+            bt_name = self.combo_dev.currentText().split("  ·")[0]
+            self.profile = profile_by_product_id(data or None, bt_name)
+            if self.worker:
+                self.worker.fast_anc = self.profile.fast_anc
             self.lbl_title.setText(self.profile.name)
             self.lbl_state.setText("已连接")
             self.lbl_pid.setText(f"产品 ID {data}" if data else "型号未知")
@@ -491,6 +732,7 @@ class App(QWidget):
             self.build_anc()
             self.build_eq(self.eq_items_builtin())
             self.refresh_codec_info()
+            self._sync_bar()
             self.adjust_height()
         elif topic == "disconnected":
             self.btn_connect.setText("连接")
@@ -498,9 +740,16 @@ class App(QWidget):
             self.lbl_state.setText("已断开")
             self.lbl_title.setText(APP_NAME)
             self.clear_state()
+            self._cur_mode = None
+            self._sync_bar()
             QMessageBox.information(self, "连接断开", str(data))
         elif topic == "battery":
             self.apply_battery(data)
+        elif topic == "anc_modes":
+            if data:
+                self.profile = self.profile.with_modes(data)
+                self.build_anc()
+                self._sync_bar()
         elif topic == "eq_catalog":
             if data:
                 items = self.eq_items_merged(data)
@@ -546,6 +795,9 @@ class App(QWidget):
             self.anc_grid.addWidget(btn, i // 4, i % 4)
         for c in range(4):
             self.anc_grid.setColumnStretch(c, 1)
+        if self._cur_mode is not None:
+            self._check(self.anc_buttons, self._cur_mode)
+        self._sync_bar()
 
     def build_eq(self, items: list[tuple[int, str, bool]], hint: str = ""):
         """items = [(eqId, 名称, 是否来自耳机目录)]，按 id 升序铺成芯片。"""
@@ -589,7 +841,10 @@ class App(QWidget):
 
     # ---- 交互 ---------------------------------------------------------------
     def on_anc(self, index: int):
+        # 先乐观更新：点下去立刻有反馈，回读结果稍后覆盖
+        self._cur_mode = index
         self._check(self.anc_buttons, index)
+        self._sync_bar()
         if self.worker:
             self.worker.anc_set(index)
 
@@ -653,6 +908,13 @@ class App(QWidget):
             v = batt.get(key)
             ring.set_state(v["level"] if v else None,
                            bool(v and v["charging"]))
+        seq = []
+        for key in ("left", "right", "case"):
+            v = batt.get(key)
+            if v:
+                seq.append(f"{v['level']}%" + ("⚡" if v["charging"] else ""))
+        self.bar_batt.setText("/".join(seq))
+        self.bar_batt.setToolTip("左 · 右 · 充电盒")
 
     def apply_event(self, ev: dict):
         name = ev.get("event")
@@ -673,7 +935,9 @@ class App(QWidget):
             self.feature_state["game"] = bool(ev["game"].get("on"))
             self.set_switch_silent("game", self.feature_state["game"])
         elif name == "noise_mode" and ev.get("index") is not None:
+            self._cur_mode = ev["index"]
             self._check(self.anc_buttons, ev["index"])
+            self._sync_bar()
         elif name == "eq_set" and ev.get("index") is not None:
             self._check(self.eq_buttons, ev["index"])
         elif name == "versions":
@@ -704,6 +968,8 @@ class App(QWidget):
         self._check(self.eq_buttons, 3)
         self.lbl_fw.setText("固件  左 118 · 右 118 · 盒 105")
         self.lbl_state.setText("已连接 · 演示数据")
+        self._cur_mode = 4
+        self._sync_bar()
         self.sw_game.blockSignals(True)
         self.sw_game.setChecked(True)
         self.sw_game.blockSignals(False)
@@ -718,6 +984,7 @@ def main() -> int:
     if "--probe" in sys.argv:
         from probe import run_probe
         return run_probe()
+    logs.setup("--verbose" in sys.argv)
     app = QApplication(sys.argv)
     win = App(demo="--demo" in sys.argv)
     win.show()

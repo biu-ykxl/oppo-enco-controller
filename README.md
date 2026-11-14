@@ -20,6 +20,8 @@ Windows 上的 OPPO / OnePlus 真无线耳机控制台，**优先适配 OPPO Enc
 | 佩戴 / 在盒状态 | 推送事件 `0x0204#2` | 真机验证 |
 | 双连设备列表 | 推送事件 `0x0204#0xF2` | 真机验证 |
 | 固件版本 | `0x0105` | 真机验证 |
+| 最小化为条状（可自定义显示项） | — | — |
+| 日志落盘（可选详细协议帧） | — | — |
 | 窗口置顶、深浅主题 | — | — |
 
 ## 使用
@@ -32,6 +34,21 @@ Windows 上的 OPPO / OnePlus 真无线耳机控制台，**优先适配 OPPO Enc
 
 要求 64 位 Windows 10/11。VC++ 运行库已打进 EXE，无需安装。首次运行若被
 SmartScreen 拦，选「更多信息 → 仍要运行」。
+
+### 条状形态（最小化）
+
+点标题栏的 **▾** 收成一条长方形横条：左边连接指示灯与耳机名，中间是降噪档位
+（**点一下切下一档**），右边是电量与常用按钮；**▴** 展开回完整面板。
+
+显示哪些内容可在 **⚙ → 条状形态显示** 里自定义（降噪切换 / 电量 / 游戏模式 /
+查找耳机），选择会被记住。条状形态与深色模式同样会记忆。
+
+### 日志
+
+所有会话与命令都写入 `%LOCALAPPDATA%\OppoEncoController\logs\app-<时间>.log`，
+只保留最近 10 个。**⚙ → 详细协议日志** 打开后额外记录每一帧收发的十六进制原文，
+排障时很有用；**⚙ → 打开日志文件夹** 直接定位。也可以用 `python app.py --verbose`
+以详细模式启动。
 
 ### 源码运行
 
@@ -55,6 +72,7 @@ python probe.py 00:AA:BB:CC:DD:EE              # 连接并 dump 全部命令回�
 python probe.py 00:AA:BB:CC:DD:EE anc 4        # 设降噪（叶子档位 ID）
 python probe.py 00:AA:BB:CC:DD:EE eqall        # 读 EQ 目录（含自定义预设）
 python probe.py 00:AA:BB:CC:DD:EE feat 0x18 on # 功能开关
+python probe.py 00:AA:BB:CC:DD:EE ancmodes     # 设备自报支持的降噪档位
 python probe.py 00:AA:BB:CC:DD:EE watch        # 持续监听推送
 ```
 
@@ -74,12 +92,18 @@ python probe.py 00:AA:BB:CC:DD:EE watch        # 持续监听推送
 - **`0x0122` 只返回具名/自定义预设**，内置 0~3 不在列表里，界面已做合并。
 - **码率读不到**：扫遍设备声明的 25 个查询命令都没有编码/码率返回，Windows 也不暴露
   A2DP codec；界面显示的是 Core Audio 混音格式（`GetMixFormat`），不是蓝牙码率。
+- **档位可以问设备**：`0x010C` 带 `03 01` 会返回支持档位的位图，界面优先用它生成
+  降噪按钮 —— 白名单没收录的 realme / 新型号因此也能用。
 
 ## 支持范围
 
 已在 **OPPO Enco Free4 丹拿版**（产品 ID `06C010`）上逐条验证。
 Free4（`068C10`）、Free3、Air4、Air3 等按同一套白名单能力表内置，
-**未逐一真机验证**；未知型号回退到通用档案（仅关 / 降噪 / 通透三档）。
+**未逐一真机验证**。
+
+**realme / OnePlus / 未收录型号**：realme 与 OPPO 同属欢律协议族，走「通用档位 +
+运行时发现」（`0x010C 03 01`），按蓝牙名 `realme` 识别。这类型号降噪切换采用
+乐观更新、不等回读（Air 系列同样处理），避免固件响应慢导致手感发滞。
 
 ## 目录结构
 
@@ -92,6 +116,7 @@ oppo/devices.py     型号能力表（ANC 档位 / EQ 预设）
 oppo/ui.py          自绘组件（电量环、拨动开关）与主题
 oppo/btwin.py       Windows 蓝牙设备枚举
 oppo/audioinfo.py   读取 Windows 输出格式（Core Audio）
+oppo/logs.py        日志落盘与详细协议帧开关
 docs/               真机验证记录、截图
 ```
 

@@ -88,6 +88,15 @@ def dump(addr: str, args: list[str]) -> int:
                 bands = " ".join(f"{b['freq']}Hz{b['gain']:+d}" for b in e["bands"])
                 print(f"    id={e['id']:2d} {'自定义' if e['custom'] else '内置  '} "
                       f"{e['name']}  {bands}")
+    elif cmd in ("ancmodes", "modes"):
+        print("[*] 查询设备支持的降噪档位 0x010C (03 01)")
+        for f in frames(0x010C, b"\x03\x01", 1.5):
+            p = f["payload"]
+            idx = [i * 8 + bit for i, byte in enumerate(p[2:])
+                   for bit in range(8) if byte >> bit & 1]
+            names = {3: "关闭", 4: "深度", 5: "中度", 6: "轻度", 7: "智能",
+                     8: "通透", 9: "自适应通透", 11: "智能自适应"}
+            print("    档位:", ", ".join(f"{i}({names.get(i, '?')})" for i in idx) or "无")
     elif cmd == "feat":
         fid = int(args[1], 0) if len(args) > 1 else 0x18
         on = args[2].lower() != "off" if len(args) > 2 else True

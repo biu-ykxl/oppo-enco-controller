@@ -8,6 +8,8 @@ from __future__ import annotations
 import socket
 import time
 
+from .logs import get as get_logger
+
 from .protocol import (CMD_ANC_QUERY, CMD_ANC_SET, CMD_BATT_GET, CMD_CAPS,
                        CMD_EQ_ALL,
                        CMD_EQ_SET, CMD_FIND_SET, CMD_GESTURES_GET,
@@ -18,7 +20,7 @@ from .protocol import (CMD_ANC_QUERY, CMD_ANC_SET, CMD_BATT_GET, CMD_CAPS,
                        anc_bitmap, decode_anc_bitmap, decode_battery, decode_caps,
                        decode_notify_event, decode_product_id,
                        decode_version_records, frame, notify_register_payload,
-                       parse_eq_entries,
+                       ANC_MODES_PAYLOAD, MODE_LABELS, parse_eq_entries,
                        parse_frames)
 
 # Windows WinSock：AF_BTH 恒为 32（部分 Python 构建未导出该常量名）
@@ -36,6 +38,9 @@ class TransportError(Exception):
     def __init__(self, msg: str, code: str = "error"):
         super().__init__(msg)
         self.code = code
+
+
+LOG = get_logger("rfcomm")
 
 
 class Buds:
@@ -85,12 +90,14 @@ class Buds:
             # 能连上不等于对：RFCOMM 上还有 HFP/AVRCP 等服务，必须用
             # 一次电量查询验证这条链路真的是控制通道。
             if self._validate(sock):
+                LOG.info("已连接 %s，通道 %d", self.addr, ch)
                 self.sock = sock
                 self.channel = ch
                 self.channel_discovered = True
                 self.lost = None
                 self._hello()
                 return
+            LOG.debug("通道 %d 无应答，继续探测", ch)
             last = f"通道 {ch} 无应答"
             try:
                 sock.close()
@@ -175,8 +182,13 @@ class Buds:
                     wait: float = 2.5) -> list[dict]:
         assert self.sock is not None, "未连接"
         seq = self._next_seq()
-        self.sock.sendall(frame(cmd, payload, seq))
-        return parse_frames(self._drain(wait))
+        pkt = frame(cmd, payload, seq)
+        LOG.debug("TX %s", pkt.hex(" ").upper())
+        self.sock.sendall(pkt)
+        raw = self._drain(wait)
+        for f in parse_frames(raw):
+            LOG.debug("RX %s", f["raw"].hex(" ").upper())
+        return parse_frames(raw)
 
     def send(self, cmd: int, payload: bytes = b"",
              wait: float = 2.5) -> list[dict]:
@@ -201,8 +213,8 @@ class Buds:
                 break
         return {"product_id": pid}
 
-    def battery(self) -> dict[str, dict]:
-        for f in self.send(CMD_BATT_GET):
+    def battery(self, wait: float = 2.5) -> dict[str, dict]:
+        for f in self.send(CMD_BATT_GET, wait=wait):
             out = decode_battery(f["payload"])
             if out:
                 return out
@@ -243,13 +255,13 @@ class Buds:
         """查找耳机（响铃）。Free4 支持 heyFindDevice；部分型号无响应。"""
         return self.send(CMD_FIND_SET, bytes([1 if ring else 0]))
 
-    def anc_query(self) -> int | None:
+    def anc_query(self, wait: float = 2.5) -> int | None:
         """查询当前 ANC 状态 -> 叶子档位 ID（真机实测 Free4：3/4/5/6/7/8/11）。
 
         回复 payload 布局：status(1) + 请求回显(2) + 状态位图(2+)。
         位索引即叶子档位 ID，而不是白名单里的 group protocolIndex。
         """
-        for f in self.send(CMD_ANC_QUERY, b"\x01\x01"):
+        for f in self.send(CMD_ANC_QUERY, b"\x01\x01", wait=wait):
             p = f["payload"]
             if len(p) < 4:
                 continue
@@ -259,6 +271,30 @@ class Buds:
                 if idx is not None:
                     return idx
         return None
+
+    def anc_modes(self) -> list[int]:
+        """查询设备支持哪些降噪档位（0x010C payload 03 01）。
+
+        官方 App 用它生成档位列表；失败返回 []，调用方回退到型号档案。
+        对白名单未收录的 realme / 新型号很关键。
+        """
+        try:
+            for f in self.send(CMD_ANC_QUERY, ANC_MODES_PAYLOAD, wait=1.2):
+                p = f["payload"]
+                if len(p) < 3:
+                    continue
+                out: list[int] = []
+                for i, byte in enumerate(p[2:]):
+                    for bit in range(8):
+                        if byte >> bit & 1:
+                            out.append(i * 8 + bit)
+                if out:
+                    LOG.info("设备声明降噪档位：%s",
+                             ", ".join(f"{i}({MODE_LABELS.get(i, '?')})" for i in out))
+                    return out
+        except (TransportError, OSError):
+            pass
+        return []
 
     def anc_set(self, leaf_index: int) -> list[dict]:
         return self.send(CMD_ANC_SET, b"\x01\x01" + anc_bitmap(leaf_index))

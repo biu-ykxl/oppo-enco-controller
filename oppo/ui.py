@@ -99,6 +99,19 @@ def stylesheet(p: dict) -> str:
         padding: 4px;
     }}
 
+    QWidget#bar {{ background: transparent; }}
+    QLabel#dot {{ color: {p['sub']}; font-size: 11px; }}
+    QLabel#dot[on="true"] {{ color: {p['ok']}; }}
+    QLabel#barname {{ color: {p['text']}; font-size: 12px; font-weight: 600; }}
+    QLabel#battmini {{ color: {p['sub']}; font-size: 11px; }}
+    QPushButton#pillMini {{
+        background: {p['card2']}; border: 1px solid {p['line']};
+        color: {p['text']}; border-radius: 10px; padding: 5px 10px;
+        font-size: 11px; text-align: left;
+    }}
+    QPushButton#pillMini:hover {{ border-color: {p['accent']};
+                                  color: {p['accent']}; }}
+
     QFrame#sep {{ background: {p['line']}; max-height: 1px; border: none; }}
     QStatusBar {{ background: transparent; color: {p['sub']}; font-size: 11px; }}
     QStatusBar::item {{ border: none; }}

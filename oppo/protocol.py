@@ -65,6 +65,14 @@ COMPONENT = {1: "left", 2: "right", 3: "case"}
 EAR = {1: "left", 2: "right", 4: "both"}
 
 # ANC modeType 名称（欢律白名单语义）
+# 降噪叶子档位 ID -> 显示名（设备实际使用这套编号，跨 OPPO/OnePlus/realme 通用）
+MODE_LABELS = {
+    3: "关闭", 4: "深度降噪", 5: "中度降噪", 6: "轻度降噪",
+    7: "智能降噪", 8: "通透", 9: "自适应通透", 11: "智能自适应",
+}
+# 官方 App 用来查「支持哪些档位」的请求
+ANC_MODES_PAYLOAD = b"\x03\x01"
+
 MODE_NAMES = {1: "off", 2: "transparency", 3: "light", 4: "deep", 5: "nc",
               6: "adaptive", 7: "smart", 8: "medium", 10: "adaptive",
               26: "原音", 28: "人声", 29: "低音", 30: "丹拿特调", 34: "丹拿特调"}
