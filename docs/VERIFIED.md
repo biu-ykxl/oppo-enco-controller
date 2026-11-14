@@ -142,3 +142,25 @@ realme 文档把长度写作 2 字节 LE，短帧下与 1 字节 varint 等价�
 - 7 个 ANC 档位正常生成，无不存在的档位；
 - 条状文字按钮点击轮转，面板同步高亮所读回的档位（通透 → 智能自适应）；
 - 分区收起后窗口高度 860 → 712。
+
+## 9. 真断开 / 自动连接（2026-11-15）
+
+Windows **没有公开 API** 可以「断开但不取消配对」。实测两条底层路径：
+
+| 方案 | 结果 |
+|---|---|
+| `IOCTL_BTH_DISCONNECT_DEVICE`（`0x41006C`，对 radio 句柄发 DeviceIoControl） | 本机驱动返回 **WinError 50（不支持）**，仅作兜底 |
+| `BluetoothEnumerateInstalledServices` + `BluetoothSetServiceState(DISABLE)` | **可用**：停用 5 项服务后，链路在 1 秒内断开 |
+
+重新连接用 `BluetoothSetServiceState(ENABLE)` 依次开 A2DP / HFP / AVRCP，
+实测 1 秒内链路恢复。两者都保留配对。
+
+实现要点：
+- 断开前先关掉本程序的 SPP 套接字，否则链路可能被占用而不断；
+- 服务已全部停用时再「断开」返回「本就未连接」，UI 视为成功；
+- 结果通过 Qt Signal 回到 GUI 线程，不能在工作线程里直接改控件。
+
+自动连接：记住上次设备地址与「启动时自动连接」开关（QSettings），
+启动后 0.5s 自动选中该设备并连接；若链路不在，先拉起 A2DP 再开控制通道。
+
+真机验证：启动自动连接 → 已连接；点断开 → 链路 False；点连接 → 链路 True。

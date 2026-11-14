@@ -212,6 +212,8 @@ class BudsWorker(threading.Thread):
 
 
 class App(QWidget):
+    sig_disconnected = Signal(bool, str)
+
     def __init__(self, demo: bool = False):
         super().__init__()
         self.dark = True
@@ -228,6 +230,7 @@ class App(QWidget):
         self._cur_eq = None
         self._eq_names: dict[int, str] = {}
         self._full_name = "未连接"
+        self.last_addr = ""
         self.settings = QSettings("OppoEncoCC", "controller")
         # 条状形态里显示哪些东西（可自定义）
         self.bar_items = {"anc": True, "eq": True, "battery": True,
@@ -289,6 +292,7 @@ class App(QWidget):
         geo = self.settings.value("geometry")
         if geo:
             self.restoreGeometry(geo)
+        self.sig_disconnected.connect(self._on_disconnected)
         self.apply_theme()
         if self.settings.value("compact", False, type=bool):
             self.toggle_compact()       # 恢复上次的条状形态
@@ -701,6 +705,11 @@ class App(QWidget):
         act_log.toggled.connect(self.set_verbose)
         m.addAction(act_log)
         m.addAction("打开日志文件夹", self.open_log_folder)
+        act_auto = QAction("启动时自动连接", self)
+        act_auto.setCheckable(True)
+        act_auto.setChecked(self.auto_connect)
+        act_auto.toggled.connect(self.set_auto_connect)
+        m.addAction(act_auto)
         act_dark = QAction("深色模式", self)
         act_dark.setCheckable(True)
         act_dark.setChecked(self.dark)
@@ -727,6 +736,10 @@ class App(QWidget):
         logs.get("app").info("详细协议日志 %s", "开启" if on else "关闭")
         self._save_settings()
 
+    def set_auto_connect(self, on: bool):
+        self.auto_connect = on
+        self.settings.setValue("auto_connect", on)
+
     def open_log_folder(self):
         path = logs.log_dir()
         path.mkdir(parents=True, exist_ok=True)
@@ -746,6 +759,8 @@ class App(QWidget):
         st = self.settings
         self.dark = st.value("dark", True, type=bool)
         self.verbose = st.value("verbose", False, type=bool)
+        self.auto_connect = st.value("auto_connect", True, type=bool)
+        self.last_addr = st.value("last_addr", "", type=str)
         for key in self.bar_items:
             self.bar_items[key] = st.value(f"bar/{key}",
                                            self.bar_items[key], type=bool)
@@ -759,6 +774,8 @@ class App(QWidget):
         st = self.settings
         st.setValue("dark", self.dark)
         st.setValue("verbose", self.verbose)
+        st.setValue("auto_connect", self.auto_connect)
+        st.setValue("last_addr", self.last_addr)
         st.setValue("compact", self.compact)
         for key, val in self.bar_items.items():
             st.setValue(f"bar/{key}", val)
@@ -901,21 +918,56 @@ class App(QWidget):
         if not found:
             self.combo_dev.addItem("未找到 OPPO 耳机，请先在系统蓝牙中配对", "")
         self.combo_dev.currentIndexChanged.connect(self._dev_changed)
+        # 优先选上次用过的设备，其次选「已连接」的那台
+        target = -1
         for i in range(self.combo_dev.count()):
-            if "已连接" in self.combo_dev.itemText(i):
-                self.combo_dev.setCurrentIndex(i)
+            if self.last_addr and self.combo_dev.itemData(i) == self.last_addr:
+                target = i
                 break
+        if target < 0:
+            for i in range(self.combo_dev.count()):
+                if "已连接" in self.combo_dev.itemText(i):
+                    target = i
+                    break
+        if target >= 0:
+            self.combo_dev.setCurrentIndex(target)
         self.btn_connect.setEnabled(bool(self.combo_dev.currentData()))
+        if self.auto_connect and not self.demo and self.last_addr \
+                and not (self.worker and self.worker.is_alive()):
+            QTimer.singleShot(500, self._auto_connect)
+
+    def _on_disconnected(self, ok: bool, msg: str):
+        self.btn_connect.setText("连接")
+        self.btn_connect.setEnabled(True)
+        self.lbl_state.setText("已断开" if ok else "断开失败")
+        self.lbl_state.setToolTip(msg)
+        self.clear_state()
+        self._sync_bar()
+        if not ok:
+            QMessageBox.information(self, "断开失败", msg)
+
+    def _auto_connect(self):
+        addr = self.combo_dev.currentData()
+        if not addr or (self.worker and self.worker.is_alive()):
+            return
+        logs.get("app").info("启动自动连接 %s", addr)
+        self.lbl_state.setText("自动连接…")
+        self.btn_connect.setText("连接中…")
+        self.btn_connect.setEnabled(False)
+        threading.Thread(target=self._ensure_link, args=(addr,),
+                         daemon=True).start()
 
     def _dev_changed(self, *_):
         self.btn_connect.setEnabled(bool(self.combo_dev.currentData()))
 
     def toggle_connect(self):
         if self.worker and self.worker.is_alive():
+            # 先停会话（关掉 SPP），再真正断开蓝牙链路
+            addr = self.worker.addr
             self.worker.stop_flag.set()
             self.worker = None
-            self.btn_connect.setText("连接")
-            self.lbl_state.setText("未连接")
+            threading.Thread(target=self._do_disconnect, args=(addr,),
+                             daemon=True).start()
             return
         addr = self.combo_dev.currentData()
         if not addr:
@@ -923,7 +975,24 @@ class App(QWidget):
         self.btn_connect.setText("连接中…")
         self.btn_connect.setEnabled(False)
         self.lbl_state.setText("正在连接…")
+        self.last_addr = addr
+        self._save_settings()
+        threading.Thread(target=self._ensure_link, args=(addr,),
+                         daemon=True).start()
+
+    def _ensure_link(self, addr: str):
+        """蓝牙链路没建立时先触发回连，再开会话。"""
+        if not btwin.is_connected(addr):
+            ok, msg = btwin.connect_device(addr)
+            logs.get("app").info("拉起链路 %s -> %s", addr, msg)
+            time.sleep(0.8)          # 等 A2DP 起来
         self._start_worker(addr)
+
+    def _do_disconnect(self, addr: str):
+        time.sleep(0.4)              # 先让 SPP 套接字关干净
+        ok, msg = btwin.disconnect_device(addr)
+        logs.get("app").info("断开 %s -> %s", addr, msg)
+        self.sig_disconnected.emit(ok, msg)
 
     def _start_worker(self, addr):
         w = BudsWorker(addr)
@@ -956,6 +1025,12 @@ class App(QWidget):
                 threading.Thread(target=self.worker.sync_feature_states,
                                  daemon=True).start()
             self.adjust_height()
+        elif topic == "disconnected_manual":
+            self.btn_connect.setText("连接")
+            self.btn_connect.setEnabled(True)
+            self.lbl_state.setText("已断开" if data else "会话已关闭")
+            self.clear_state()
+            self._sync_bar()
         elif topic == "disconnected":
             self.btn_connect.setText("连接")
             self.btn_connect.setEnabled(True)
