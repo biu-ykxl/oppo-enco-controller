@@ -225,10 +225,12 @@ class App(QWidget):
         self.compact = False
         self.verbose = False
         self._cur_mode = None
+        self._cur_eq = None
+        self._eq_names: dict[int, str] = {}
         self._full_name = "未连接"
         self.settings = QSettings("OppoEncoCC", "controller")
         # 条状形态里显示哪些东西（可自定义）
-        self.bar_items = {"anc": True, "battery": True,
+        self.bar_items = {"anc": True, "eq": True, "battery": True,
                           "game": False, "find": False}
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
@@ -513,6 +515,14 @@ class App(QWidget):
         self.btn_bar_anc.setToolTip("点击切换降噪模式")
         self.btn_bar_anc.clicked.connect(self.cycle_anc)
 
+        self.btn_bar_eq = QPushButton("音效 ▾")
+        self.btn_bar_eq.setObjectName("pillMini")
+        self.btn_bar_eq.setFixedWidth(108)
+        self.btn_bar_eq.setCursor(Qt.PointingHandCursor)
+        self.btn_bar_eq.setToolTip("切换音效预设")
+        self.btn_bar_eq.clicked.connect(self.open_eq_menu)
+        self.bar_eq_menu = QMenu(self)
+
         self.bar_batt = QLabel("")
         self.bar_batt.setObjectName("battmini")
 
@@ -557,6 +567,7 @@ class App(QWidget):
         row.addWidget(self.bar_dot)
         row.addWidget(self.bar_name, 1)
         row.addWidget(self.btn_bar_anc)
+        row.addWidget(self.btn_bar_eq)
         row.addWidget(self.bar_batt)
         for b in (self.btn_bar_game, self.btn_bar_find, self.btn_bar_pin,
                   self.btn_bar_log, self.btn_expand, self.btn_bar_close):
@@ -565,8 +576,15 @@ class App(QWidget):
         return w
 
     def _bar_width(self) -> int:
-        extra = int(self.bar_items["game"]) + int(self.bar_items["find"])
-        return 500 + extra * 28
+        """条状宽度按当前显示的项累加，关掉一项就窄一点。"""
+        w = 380                                   # 指示灯 + 名称 + 电量 + 4 个固定按钮
+        if self.bar_items["anc"]:
+            w += 104
+        if self.bar_items["eq"]:
+            w += 108
+        w += 28 * int(self.bar_items["game"])
+        w += 28 * int(self.bar_items["find"])
+        return min(w, 700)
 
     def toggle_compact(self):
         self.compact = not self.compact
@@ -623,12 +641,37 @@ class App(QWidget):
             self.btn_bar_anc.setText("降噪 —")
             self.btn_bar_anc.setToolTip("点击切换降噪模式")
         self.btn_bar_anc.setVisible(self.bar_items["anc"])
+        self.btn_bar_eq.setVisible(self.bar_items["eq"])
+        if self._cur_eq is not None:
+            name = self._eq_name(self._cur_eq)
+            self.btn_bar_eq.setText(name[:8] + " ▾")
+            self.btn_bar_eq.setToolTip(f"音效：{name}（点击选择）")
+        else:
+            self.btn_bar_eq.setText("音效 ▾")
         self.bar_batt.setVisible(self.bar_items["battery"])
         self.btn_bar_game.setVisible(self.bar_items["game"])
         self.btn_bar_find.setVisible(self.bar_items["find"] and self.profile.find)
 
     def _elide_bar_name(self):
         """保留接口：现在由 MarqueeLabel 负责滚动显示。"""
+
+    def _eq_name(self, eq_id: int) -> str:
+        return self._eq_names.get(eq_id, f"音效 {eq_id}")
+
+    def open_eq_menu(self):
+        """条状：音效预设下拉。"""
+        if not self._eq_names:
+            return
+        m = self.bar_eq_menu
+        m.clear()
+        for eq_id, name in sorted(self._eq_names.items()):
+            act = QAction(name, self)
+            act.setCheckable(True)
+            act.setChecked(eq_id == self._cur_eq)
+            act.triggered.connect(lambda _=False, k=eq_id: self.on_eq(k))
+            m.addAction(act)
+        m.exec(self.btn_bar_eq.mapToGlobal(
+            self.btn_bar_eq.rect().bottomLeft()))
 
     def on_bar_game(self, on: bool):
         if self.sw_game.isChecked() != on:
@@ -638,8 +681,9 @@ class App(QWidget):
     def open_settings(self):
         m = QMenu(self)
         sub = m.addMenu("条状形态显示")
-        for key, label in (("anc", "降噪切换"), ("battery", "电量"),
-                           ("game", "游戏模式"), ("find", "查找耳机")):
+        for key, label in (("anc", "降噪切换"), ("eq", "音效切换"),
+                           ("battery", "电量"), ("game", "游戏模式"),
+                           ("find", "查找耳机")):
             act = QAction(label, self)
             act.setCheckable(True)
             act.setChecked(self.bar_items[key])
@@ -992,8 +1036,10 @@ class App(QWidget):
             btn.clicked.connect(lambda _=False, k=eq_id: self.on_eq(k))
             self.eq_buttons[eq_id] = btn
             self.eq_flow.addWidget(btn)
+        self._eq_names = {eq_id: name for eq_id, name, _dev in items}
         if hint:
             self.eq_hint.setText(hint)
+        self._sync_bar()
 
     def eq_items_builtin(self) -> list[tuple[int, str, bool]]:
         return [(e["index"], e["label"], False) for e in self.profile.eq]
@@ -1020,7 +1066,9 @@ class App(QWidget):
             self.worker.anc_set(index)
 
     def on_eq(self, eq_id: int):
+        self._cur_eq = eq_id
         self._check(self.eq_buttons, eq_id)
+        self._sync_bar()
         if self.worker:
             self.worker.eq_set(eq_id)
 
@@ -1110,7 +1158,9 @@ class App(QWidget):
             self._check(self.anc_buttons, ev["index"])
             self._sync_bar()
         elif name == "eq_set" and ev.get("index") is not None:
+            self._cur_eq = ev["index"]
             self._check(self.eq_buttons, ev["index"])
+            self._sync_bar()
         elif name == "versions":
             recs = ev.get("records") or []
             by = {(r["component"], r["kind"]): r["value"] for r in recs}
