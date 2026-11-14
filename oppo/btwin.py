@@ -184,6 +184,9 @@ SERVICE_DISABLE = 0
 SERVICE_ENABLE = 1
 
 
+_DISABLED_SERVICES: dict[str, list[str]] = {}
+
+
 def _addr_to_int(addr: str) -> int:
     return int(addr.replace(":", "").replace("-", ""), 16)
 
@@ -258,9 +261,16 @@ def _still_connected(lib, hradio, addr: str) -> bool:
 
 
 def disconnect_device(addr: str) -> tuple[bool, str]:
-    """真正断开该设备的链路（保留配对）。"""
+    """真正断开该设备的链路（保留配对）。
+
+    只停用 A2DP 服务即可让系统释放链路（实测 3.1s，比逐个停用 3 项快 3 倍），
+    其余服务保持启用 —— 这样重连时不会因为「某些服务仍是停用状态」而连上掉线。
+    若停 A2DP 后链路仍在，再依次停 HFP/AVRCP 兜底。
+    """
     if not IS_WINDOWS:
         return False, "仅 Windows 支持"
+
+    disabled: list[str] = []
 
     def run(lib, hradio):
         if not _still_connected(lib, hradio, addr):
@@ -268,17 +278,16 @@ def disconnect_device(addr: str) -> tuple[bool, str]:
         info = _device_info(lib, hradio, addr)
         if info is None:
             return False, "读不到设备信息（可能未配对）"
-        services = _installed_services(lib, hradio, info)
-        disabled = 0
-        for g in services:
-            like = GUID.from_buffer_copy(g)
-            res = _set_service(
-                lib, hradio, info,
-                "{:08X}-{:04X}-{:04X}-{}".format(
-                    like.Data1, like.Data2, like.Data3,
-                    "-".join(f"{b:02X}" for b in like.Data4)), SERVICE_DISABLE)
-            if res == 0:
-                disabled += 1
+
+        for guid in (GUID_A2DP, GUID_HFP, GUID_AVRCP):
+            if _set_service(lib, hradio, info, guid, SERVICE_DISABLE) == 0:
+                disabled.append(guid)
+            # 每次停用后立刻看链路是否已释放（停用调用本身会阻塞约 3s）
+            for _ in range(10):
+                if not _still_connected(lib, hradio, addr):
+                    return True, "已断开"
+                time.sleep(0.06)
+
         # 兜底：部分驱动接受强制断开 IOCTL
         try:
             addr_val = ctypes.c_ulonglong(_addr_to_int(addr))
@@ -293,18 +302,20 @@ def disconnect_device(addr: str) -> tuple[bool, str]:
                                 ctypes.byref(returned), None)
         except Exception:
             pass
-        # 等链路真正释放（最多 2 秒）
-        for _ in range(10):
+        for _ in range(15):
             if not _still_connected(lib, hradio, addr):
-                return True, f"已断开（停用 {disabled} 项服务）"
-            time.sleep(0.2)
+                return True, "已断开"
+            time.sleep(0.08)
         return False, "停用了服务但链路仍未断开"
 
-    return _with_radio(run)
+    ok, msg = _with_radio(run)
+    if ok and disabled:
+        _DISABLED_SERVICES[addr.upper()] = list(disabled)
+    return ok, msg
 
 
 def connect_device(addr: str) -> tuple[bool, str]:
-    """触发回连：A2DP 服务先关再开，Windows 会重新建立音频链路。"""
+    """触发回连：重新启用之前停用的服务（默认只有 A2DP）。"""
     if not IS_WINDOWS:
         return False, "仅 Windows 支持"
 
@@ -312,12 +323,16 @@ def connect_device(addr: str) -> tuple[bool, str]:
         info = _device_info(lib, hradio, addr)
         if info is None:
             return False, "读不到设备信息（可能未配对）"
+        guids = _DISABLED_SERVICES.get(addr.upper()) or [GUID_A2DP]
+        if not _DISABLED_SERVICES.get(addr.upper()):
+            # 没记录也无所谓：先关再开 A2DP 一样能触发回连
+            _set_service(lib, hradio, info, GUID_A2DP, SERVICE_DISABLE)
         ok = False
-        for guid_s in (GUID_A2DP, GUID_HFP, GUID_AVRCP):
-            _set_service(lib, hradio, info, guid_s, SERVICE_DISABLE)
-            if _set_service(lib, hradio, info, guid_s, SERVICE_ENABLE) == 0:
+        for guid in guids:
+            if _set_service(lib, hradio, info, guid, SERVICE_ENABLE) == 0:
                 ok = True
         if ok:
+            _DISABLED_SERVICES.pop(addr.upper(), None)
             return True, "已发起连接"
         return False, "连接失败（服务状态未改变）"
 
@@ -325,8 +340,17 @@ def connect_device(addr: str) -> tuple[bool, str]:
 
 
 def is_connected(addr: str) -> bool:
-    target = addr.upper()
-    for d in list_bt_devices():
-        if d["address"].upper() == target:
-            return bool(d["connected"])
-    return False
+    """实时查询该设备是否已连接。
+
+    注意：list_bt_devices() 来自设备搜索，fConnected 有明显滞后（断开后仍报
+    True），判断链路状态必须用 BluetoothGetDeviceInfo 实时值。
+    """
+    if not IS_WINDOWS:
+        return False
+
+    def run(lib, hradio):
+        info = _device_info(lib, hradio, addr)
+        return (bool(info is not None and info.fConnected), "ok")
+
+    ok, _ = _with_radio(run)
+    return ok

@@ -18,7 +18,8 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import QPoint, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (QObject, QPoint, QSettings, QSize, Qt, QTimer,
+                            Signal)
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -46,7 +47,7 @@ EQ_FALLBACK_NAMES = {0: "至臻原音", 1: "纯享人声", 2: "澎湃低音",
 class BudsWorker(threading.Thread):
     """会话线程：连接、轮询、订阅推送、执行写命令。"""
 
-    class _Bridge(QWidget):
+    class _Bridge(QObject):
         sig = Signal(str, object)
 
     def __init__(self, addr: str):
@@ -55,11 +56,20 @@ class BudsWorker(threading.Thread):
         self.buds: Buds | None = None
         self.stop_flag = threading.Event()
         self.bridge = self._Bridge()
-        self.bridge.hide()
         self.product_id: str | None = None
         self.fast_anc = False        # Air 系列等：跳过回读校验
         self.game_features: tuple[int, ...] = (0x06,)
         self._cmd_lock = threading.Lock()
+
+    def shutdown(self):
+        """立刻关套接字（不等 polling 周期），让线程和 ACL 尽快释放。"""
+        self.stop_flag.set()
+        sock = getattr(self.buds, "sock", None) if self.buds else None
+        if sock is not None:
+            try:
+                sock.close()          # 直接关，避免等锁
+            except OSError:
+                pass
 
     def post(self, fn):
         with self._cmd_lock:
@@ -71,6 +81,8 @@ class BudsWorker(threading.Thread):
                 self._emit("error", str(e))
             except OSError as e:
                 self._emit("error", f"蓝牙错误：{e}")
+            except AssertionError:
+                self._emit("error", "会话已关闭")
 
     def _emit(self, topic: str, data):
         self.bridge.sig.emit(topic, data)
@@ -88,11 +100,15 @@ class BudsWorker(threading.Thread):
                 break
             except (TransportError, OSError) as e:
                 last_err = e
+                logs.get("session").warning("第 %d 次连接失败：%s", attempt + 1,
+                                            str(e)[:120])
                 # 耳机刚出盒时蓝牙分页常要几秒才通，重试两次
                 time.sleep(1.5)
         if last_err is not None:
+            logs.get("session").error("会话建立失败：%s", last_err)
             self._emit("disconnected", f"连接失败：{last_err}")
             return
+        logs.get("session").info("会话已建立：%s", self.addr)
         try:
             self.product_id = self.buds.info().get("product_id")
             self._emit("connected", self.product_id or "")
@@ -213,6 +229,7 @@ class BudsWorker(threading.Thread):
 
 class App(QWidget):
     sig_disconnected = Signal(bool, str)
+    sig_start_worker = Signal(str)
 
     def __init__(self, demo: bool = False):
         super().__init__()
@@ -231,6 +248,7 @@ class App(QWidget):
         self._eq_names: dict[int, str] = {}
         self._full_name = "未连接"
         self.last_addr = ""
+        self._retry_left = 1
         self.settings = QSettings("OppoEncoCC", "controller")
         # 条状形态里显示哪些东西（可自定义）
         self.bar_items = {"anc": True, "eq": True, "battery": True,
@@ -293,6 +311,7 @@ class App(QWidget):
         if geo:
             self.restoreGeometry(geo)
         self.sig_disconnected.connect(self._on_disconnected)
+        self.sig_start_worker.connect(self._start_worker)
         self.apply_theme()
         if self.settings.value("compact", False, type=bool):
             self.toggle_compact()       # 恢复上次的条状形态
@@ -774,7 +793,6 @@ class App(QWidget):
         st = self.settings
         st.setValue("dark", self.dark)
         st.setValue("verbose", self.verbose)
-        st.setValue("auto_connect", self.auto_connect)
         st.setValue("last_addr", self.last_addr)
         st.setValue("compact", self.compact)
         for key, val in self.bar_items.items():
@@ -936,15 +954,19 @@ class App(QWidget):
                 and not (self.worker and self.worker.is_alive()):
             QTimer.singleShot(500, self._auto_connect)
 
+    def _reconnect(self, addr: str):
+        self.btn_connect.setText("连接中…")
+        self.btn_connect.setEnabled(False)
+        self.lbl_state.setText("正在连接…")
+        threading.Thread(target=self._ensure_link, args=(addr,),
+                         daemon=True).start()
+
     def _on_disconnected(self, ok: bool, msg: str):
-        self.btn_connect.setText("连接")
-        self.btn_connect.setEnabled(True)
-        self.lbl_state.setText("已断开" if ok else "断开失败")
         self.lbl_state.setToolTip(msg)
-        self.clear_state()
-        self._sync_bar()
-        if not ok:
-            QMessageBox.information(self, "断开失败", msg)
+        if ok:
+            return
+        self.lbl_state.setText("断开失败")
+        QMessageBox.information(self, "断开失败", msg)
 
     def _auto_connect(self):
         addr = self.combo_dev.currentData()
@@ -962,11 +984,18 @@ class App(QWidget):
 
     def toggle_connect(self):
         if self.worker and self.worker.is_alive():
-            # 先停会话（关掉 SPP），再真正断开蓝牙链路
+            # 先停会话（关掉 SPP），立刻给 UI 反馈，真实断链放到后台
             addr = self.worker.addr
-            self.worker.stop_flag.set()
+            worker = self.worker
+            worker.shutdown()
             self.worker = None
-            threading.Thread(target=self._do_disconnect, args=(addr,),
+            # 立刻反馈，断链在后台完成（服务调用本身要 ~3s）
+            self.btn_connect.setText("连接")
+            self.btn_connect.setEnabled(True)
+            self.lbl_state.setText("已断开")
+            self.clear_state()
+            self._sync_bar()
+            threading.Thread(target=self._do_disconnect, args=(worker, addr),
                              daemon=True).start()
             return
         addr = self.combo_dev.currentData()
@@ -976,32 +1005,73 @@ class App(QWidget):
         self.btn_connect.setEnabled(False)
         self.lbl_state.setText("正在连接…")
         self.last_addr = addr
+        self._retry_left = 1
         self._save_settings()
         threading.Thread(target=self._ensure_link, args=(addr,),
                          daemon=True).start()
 
     def _ensure_link(self, addr: str):
-        """蓝牙链路没建立时先触发回连，再开会话。"""
+        """并行拉起链路与控制通道：SPP 不依赖 A2DP，别串行等。"""
         if not btwin.is_connected(addr):
-            ok, msg = btwin.connect_device(addr)
-            logs.get("app").info("拉起链路 %s -> %s", addr, msg)
-            time.sleep(0.8)          # 等 A2DP 起来
-        self._start_worker(addr)
+            threading.Thread(
+                target=lambda: logs.get("app").info(
+                    "拉起链路 %s -> %s", addr, btwin.connect_device(addr)[1]),
+                daemon=True).start()
 
-    def _do_disconnect(self, addr: str):
-        time.sleep(0.4)              # 先让 SPP 套接字关干净
+        for attempt in (1, 2):
+            old = self.worker
+            if old is not None:
+                old.stop_flag.set()
+                old.join(1.0)
+                if self.worker is old:
+                    self.worker = None
+            self.sig_start_worker.emit(addr)      # 在 GUI 线程创建会话
+            # 等会话建立（最多 6s）
+            for _ in range(24):
+                time.sleep(0.25)
+                w = self.worker
+                if w is None:
+                    break
+                if w.product_id is not None:
+                    return
+                if not w.is_alive():
+                    break
+            logs.get("app").info("控制通道未就绪，第 %d 次重试", attempt)
+            # 链路还没起来的话，等它起来再试
+            for _ in range(20):
+                if btwin.is_connected(addr):
+                    break
+                time.sleep(0.2)
+            time.sleep(0.4)
+
+    def _do_disconnect(self, worker, addr: str):
+        # 关键：先等会话线程退出（关掉 SPP 套接字），否则 ACL 被它占着，
+        # 停音频服务也断不掉链路。
+        t0 = time.time()
+        if worker is not None:
+            worker.join(0.8)
+        logs.get("app").debug("join 用时 %.2fs", time.time() - t0)
+        t1 = time.time()
         ok, msg = btwin.disconnect_device(addr)
+        logs.get("app").debug("disconnect 用时 %.2fs", time.time() - t1)
+        if not ok:
+            time.sleep(0.4)
+            ok, msg = btwin.disconnect_device(addr)   # 再试一次
         logs.get("app").info("断开 %s -> %s", addr, msg)
         self.sig_disconnected.emit(ok, msg)
 
     def _start_worker(self, addr):
         w = BudsWorker(addr)
-        w.bridge.sig.connect(self.on_worker_event)
+        w.bridge.sig.connect(
+            lambda topic, data, src=w: self.on_worker_event(topic, data, src))
         self.worker = w
         w.start()
 
     # ---- 事件 ---------------------------------------------------------------
-    def on_worker_event(self, topic: str, data):
+    def on_worker_event(self, topic: str, data, src=None):
+        # 旧会话（被替换掉的重试线程）发来的事件一律忽略，否则会把新会话踢掉
+        if src is not None and src is not self.worker:
+            return
         if topic == "connected":
             bt_name = self.combo_dev.currentText().split("  ·")[0]
             self.profile = profile_by_product_id(data or None, bt_name)
@@ -1022,8 +1092,7 @@ class App(QWidget):
             self.refresh_codec_info()
             self._sync_bar()
             if self.worker:
-                threading.Thread(target=self.worker.sync_feature_states,
-                                 daemon=True).start()
+                self.worker.sync_feature_states()
             self.adjust_height()
         elif topic == "disconnected_manual":
             self.btn_connect.setText("连接")
@@ -1034,12 +1103,18 @@ class App(QWidget):
         elif topic == "disconnected":
             self.btn_connect.setText("连接")
             self.btn_connect.setEnabled(True)
-            self.lbl_state.setText("已断开")
             self.lbl_title.setText(APP_NAME)
             self.clear_state()
             self._cur_mode = None
             self._sync_bar()
-            QMessageBox.information(self, "连接断开", str(data))
+            if self._retry_left > 0 and self.last_addr:
+                self._retry_left -= 1
+                self.lbl_state.setText("重连中…")
+                logs.get("app").warning("会话掉线，自动重连一次：%s", data)
+                QTimer.singleShot(1500, lambda: self._reconnect(self.last_addr))
+            else:
+                self.lbl_state.setText("已断开")
+                QMessageBox.information(self, "连接断开", str(data))
         elif topic == "battery":
             self.apply_battery(data)
         elif topic == "anc_modes":
