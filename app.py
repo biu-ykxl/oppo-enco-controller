@@ -508,12 +508,13 @@ class App(QWidget):
         self.bar_name.setText("未连接")
         self.bar_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        self.btn_bar_anc = QPushButton("降噪 —")
+        self.btn_bar_anc = QPushButton("降噪 ▾")
         self.btn_bar_anc.setObjectName("pillMini")
         self.btn_bar_anc.setFixedWidth(104)
         self.btn_bar_anc.setCursor(Qt.PointingHandCursor)
-        self.btn_bar_anc.setToolTip("点击切换降噪模式")
-        self.btn_bar_anc.clicked.connect(self.cycle_anc)
+        self.btn_bar_anc.setToolTip("选择降噪模式")
+        self.btn_bar_anc.clicked.connect(self.open_anc_menu)
+        self.bar_anc_menu = QMenu(self)
 
         self.btn_bar_eq = QPushButton("音效 ▾")
         self.btn_bar_eq.setObjectName("pillMini")
@@ -611,16 +612,20 @@ class App(QWidget):
         h = max(self.minimumHeight(), min(self.height(), 2000))
         self.resize(self.width(), h)
 
-    def cycle_anc(self):
-        """条状形态：文字按钮，点一下切到下一档。"""
-        modes = [m["index"] for m in self.profile.anc]
-        if not modes:
+    def open_anc_menu(self):
+        """条状形态：降噪下拉，直接选档位。"""
+        if not self.profile.anc:
             return
-        try:
-            i = modes.index(self._cur_mode)
-        except ValueError:
-            i = -1
-        self.on_anc(modes[(i + 1) % len(modes)])
+        m = self.bar_anc_menu
+        m.clear()
+        for a in self.profile.anc:
+            act = QAction(a["label"], self)
+            act.setCheckable(True)
+            act.setChecked(a["index"] == self._cur_mode)
+            act.triggered.connect(lambda _=False, k=a["index"]: self.on_anc(k))
+            m.addAction(act)
+        m.exec(self.btn_bar_anc.mapToGlobal(
+            self.btn_bar_anc.rect().bottomLeft()))
 
     def _sync_bar(self):
         """把连接状态与当前档位同步到条状形态。"""
@@ -635,11 +640,11 @@ class App(QWidget):
         self.bar_dot.style().polish(self.bar_dot)
         if self._cur_mode is not None:
             label = self.profile.anc_label(self._cur_mode)
-            self.btn_bar_anc.setText(label)
-            self.btn_bar_anc.setToolTip(f"降噪：{label}（点击切换下一档）")
+            self.btn_bar_anc.setText(label + " ▾")
+            self.btn_bar_anc.setToolTip(f"降噪：{label}（点击选择）")
         else:
-            self.btn_bar_anc.setText("降噪 —")
-            self.btn_bar_anc.setToolTip("点击切换降噪模式")
+            self.btn_bar_anc.setText("降噪 ▾")
+            self.btn_bar_anc.setToolTip("选择降噪模式")
         self.btn_bar_anc.setVisible(self.bar_items["anc"])
         self.btn_bar_eq.setVisible(self.bar_items["eq"])
         if self._cur_eq is not None:
