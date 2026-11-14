@@ -5,12 +5,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import (QEasingCurve, QRectF, Qt, QVariantAnimation,
-                            Signal)
+from PySide6.QtCore import (QEasingCurve, QPoint, QRect, QRectF, QSize, Qt,
+                            QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QAbstractButton, QHBoxLayout, QLabel,
-                               QPushButton, QSizePolicy, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QAbstractButton, QHBoxLayout, QLabel, QLayout,
+                               QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 DARK = {
     "bg": "#14161B", "card": "#1B1E25", "card2": "#22262F",
@@ -106,6 +105,18 @@ def stylesheet(p: dict) -> str:
     }}
 
     QWidget#bar {{ background: transparent; }}
+    QScrollArea#scroll, QWidget#panelBody {{ background: transparent; }}
+    QScrollBar:vertical {{
+        background: transparent; width: 8px; margin: 2px;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {p['line']}; border-radius: 4px; min-height: 28px;
+    }}
+    QScrollBar::handle:vertical:hover {{ background: {p['sub']}; }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+        background: transparent;
+    }}
     QLabel#dot {{ color: {p['sub']}; font-size: 11px; }}
     QLabel#dot[on="true"] {{ color: {p['ok']}; }}
     QLabel#barname {{ color: {p['text']}; font-size: 12px; font-weight: 600; }}
@@ -357,3 +368,212 @@ class Collapsible(QWidget):
         self.btn_toggle.setText("▸" if on else "▾")
         if notify:
             self.toggled.emit(on)
+
+
+class MarqueeLabel(QWidget):
+    """跑马灯文字：文字超出宽度时左右循环滚动，否则居中显示。"""
+
+    def __init__(self, p: dict, parent=None):
+        super().__init__(parent)
+        self.p = p
+        self._text = ""
+        self._offset = 0.0
+        self._gap = 28.0            # 循环时两段文字之间的空隙
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)  # ~30fps
+        self._timer.timeout.connect(self._step)
+        self.setMinimumWidth(60)
+        self.setFixedHeight(20)
+
+    def setText(self, text: str):
+        self._text = text or ""
+        self._offset = 0.0
+        self._restart()
+
+    def text(self) -> str:
+        return self._text
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._restart()
+
+    def _restart(self):
+        need = self._text_width() + self._gap > self.width() + 2
+        if need and not self._timer.isActive():
+            self._timer.start()
+        elif not need and self._timer.isActive():
+            self._timer.stop()
+            self._offset = 0.0
+        self.update()
+
+    def _text_width(self) -> float:
+        from PySide6.QtGui import QFontMetrics
+        return QFontMetrics(self.font()).horizontalAdvance(self._text)
+
+    def _step(self):
+        tw = self._text_width()
+        if tw <= 0:
+            return
+        self._offset += 0.9
+        if self._offset > tw + self._gap:
+            self._offset = 0.0
+        self.update()
+
+    def set_palette(self, p: dict):
+        self.p = p
+        self.update()
+
+    def paintEvent(self, _e):
+        pt = QPainter(self)
+        pt.setRenderHint(QPainter.Antialiasing)
+        pt.setClipRect(self.rect())      # 文字不能画到按钮上
+        pt.setPen(QColor(self.p["text"]))
+        f = self.font()
+        f.setPixelSize(12)
+        f.setBold(True)
+        pt.setFont(f)
+        fm = pt.fontMetrics()
+        y = (self.height() + fm.ascent() - fm.descent()) / 2
+        tw = fm.horizontalAdvance(self._text)
+        if tw + self._gap <= self.width() + 2:
+            pt.drawText(QRectF(0, 0, self.width(), self.height()),
+                        Qt.AlignLeft | Qt.AlignVCenter, self._text)
+        else:
+            x = -self._offset
+            pt.drawText(QRectF(x, 0, tw + 4, self.height()),
+                        Qt.AlignLeft | Qt.AlignVCenter, self._text)
+            # 第二段，形成无缝循环
+            pt.drawText(QRectF(x + tw + self._gap, 0, tw + 4, self.height()),
+                        Qt.AlignLeft | Qt.AlignVCenter, self._text)
+        pt.end()
+
+
+class FlowLayout(QLayout):
+    """流式布局：按可用宽度自动换行（参考 Qt 官方 FlowLayout 示例）。
+
+    用于降噪胶囊与音效芯片，窗口变窄时自动折行，不会把窗口最小宽度撑大。
+    """
+
+    def __init__(self, parent=None, margin: int = 0,
+                 hspacing: int = 6, vspacing: int = 6):
+        super().__init__(parent)
+        self._items = []
+        self._h = hspacing
+        self._v = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def clear(self):
+        while self._items:
+            item = self._items.pop()
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = eff.x(), eff.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            w, h = hint.width(), hint.height()
+            if x + w > eff.right() + 1 and line_h > 0:
+                x = eff.x()
+                y += line_h + self._v
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += w + self._h
+            line_h = max(line_h, h)
+        return y + line_h - rect.y() + m.bottom()
+
+
+class ElidedLabel(QWidget):
+    """单行文字，宽度不够时自动省略；min size 很小，不会撑大布局。"""
+
+    def __init__(self, text: str, p: dict, *, pixel: int = 15,
+                 bold: bool = True, max_width: int = 210, parent=None):
+        super().__init__(parent)
+        self.p = p
+        self._text = text
+        self._pixel = pixel
+        self._bold = bold
+        self._max = max_width
+        self.setFixedHeight(pixel + 6)
+        self.setMinimumWidth(56)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+    def setText(self, text: str):
+        self._text = text
+        self.update()
+
+    def text(self) -> str:
+        return self._text
+
+    def set_palette(self, p: dict):
+        self.p = p
+        self.update()
+
+    def _font(self):
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(self._pixel)
+        f.setBold(self._bold)
+        return f
+
+    def sizeHint(self):
+        from PySide6.QtGui import QFontMetrics
+        w = QFontMetrics(self._font()).horizontalAdvance(self._text) + 4
+        return QSize(min(w, self._max), self.height())
+
+    def minimumSizeHint(self):
+        return QSize(56, self.height())
+
+    def paintEvent(self, _e):
+        from PySide6.QtGui import QFontMetrics
+        pt = QPainter(self)
+        pt.setRenderHint(QPainter.Antialiasing)
+        pt.setClipRect(self.rect())
+        f = self._font()
+        pt.setFont(f)
+        pt.setPen(QColor(self.p["text"]))
+        fm = QFontMetrics(f)
+        txt = fm.elidedText(self._text, Qt.ElideRight, self.width() - 2)
+        y = (self.height() + fm.ascent() - fm.descent()) / 2
+        pt.drawText(QRectF(0, 0, self.width(), self.height()),
+                    Qt.AlignLeft | Qt.AlignVCenter, txt)
+        pt.end()

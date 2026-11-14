@@ -18,11 +18,12 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import QPoint, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMenu, QMessageBox, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+    QMenu, QMessageBox, QPushButton, QScrollArea, QSizeGrip, QSizePolicy,
+    QVBoxLayout, QWidget)
 
 from oppo import audioinfo, btwin, logs
 from oppo.devices import (GENERIC, looks_like_supported,
@@ -30,8 +31,8 @@ from oppo.devices import (GENERIC, looks_like_supported,
 from oppo.protocol import (FEATURE_GAME_MODE, FEATURE_HIGH_QUALITY,
                            HQ_OFF, HQ_ON)
 from oppo.transport import Buds, TransportError
-from oppo.ui import (BatteryRing, Collapsible, SectionTitle, Toggle,
-                     palette, stylesheet)
+from oppo.ui import (BatteryRing, Collapsible, ElidedLabel, FlowLayout,
+                     MarqueeLabel, SectionTitle, Toggle, palette, stylesheet)
 
 APP_NAME = "OPPO Enco"
 APP_VERSION = "v1.3.0"
@@ -224,6 +225,7 @@ class App(QWidget):
         self.compact = False
         self.verbose = False
         self._cur_mode = None
+        self._full_name = "未连接"
         self.settings = QSettings("OppoEncoCC", "controller")
         # 条状形态里显示哪些东西（可自定义）
         self.bar_items = {"anc": True, "battery": True,
@@ -231,8 +233,11 @@ class App(QWidget):
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedWidth(432)
-        self.resize(432, 760)
+        self.setMinimumSize(420, 320)      # 允许用户自由拉伸
+        self.resize(468, 800)
+        self._normal_size = None
+        self._resize_edge = ""             # 无边框窗口的拖拽缩放边
+        self._resize_start = None
 
         self.root = QWidget(self)
         self.root.setObjectName("root")
@@ -245,6 +250,7 @@ class App(QWidget):
         root_lay.setSpacing(0)
 
         self.panel = QWidget()
+        self.panel.setObjectName("panelBody")
         lay = QVBoxLayout(self.panel)
         lay.setContentsMargins(22, 18, 22, 16)
         lay.setSpacing(12)
@@ -261,12 +267,26 @@ class App(QWidget):
         lay.addStretch(1)
         lay.addWidget(self._build_footer())
 
+        # 内容放滚动区：窗口拉小后可以滚动查看
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setWidget(self.panel)
+        self.scroll.setObjectName("scroll")
+
         self.bar = self._build_bar()
         self.bar.setVisible(False)
-        root_lay.addWidget(self.panel)
+        root_lay.addWidget(self.scroll)
         root_lay.addWidget(self.bar)
 
+        self.grip = QSizeGrip(self.root)      # 右下角拖拽缩放
+        self.grip.setFixedSize(14, 14)
+
         self._load_settings()
+        geo = self.settings.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
         self.apply_theme()
         if self.settings.value("compact", False, type=bool):
             self.toggle_compact()       # 恢复上次的条状形态
@@ -286,8 +306,8 @@ class App(QWidget):
     def _build_header(self):
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.lbl_title = QLabel(APP_NAME)
-        self.lbl_title.setObjectName("title")
+        self.lbl_title = ElidedLabel(APP_NAME, self.p, pixel=15, max_width=214)
+        self._title_full = APP_NAME
         self.lbl_state = QLabel("未连接")
         self.lbl_state.setObjectName("sub")
         row.addWidget(self.lbl_title)
@@ -319,11 +339,10 @@ class App(QWidget):
         self.btn_close.setObjectName("icon")
         self.btn_close.setCursor(Qt.PointingHandCursor)
         self.btn_close.clicked.connect(self.close)
-        row.addWidget(self.btn_settings)
-        row.addWidget(self.btn_min)
-        row.addWidget(self.btn_theme)
-        row.addWidget(self.btn_pin)
-        row.addWidget(self.btn_close)
+        for b in (self.btn_settings, self.btn_min, self.btn_theme,
+                  self.btn_pin, self.btn_close):
+            b.setFixedSize(26, 26)
+            row.addWidget(b)
         return row
 
     def _build_device_row(self):
@@ -375,10 +394,9 @@ class App(QWidget):
 
     def _build_anc(self):
         sec = self._section("anc", "降噪")
-        self.anc_grid = QGridLayout()
-        self.anc_grid.setSpacing(6)
+        self.anc_flow = FlowLayout(hspacing=6, vspacing=6)
         holder = QWidget()
-        holder.setLayout(self.anc_grid)
+        holder.setLayout(self.anc_flow)
         sec.add(holder)
         return sec
 
@@ -388,10 +406,9 @@ class App(QWidget):
         self.eq_hint = QLabel("连接后自动读取耳机内置与自定义预设")
         self.eq_hint.setObjectName("sub")
         sec.add(self.eq_hint)
-        self.eq_grid = QGridLayout()
-        self.eq_grid.setSpacing(6)
+        self.eq_flow = FlowLayout(hspacing=6, vspacing=6)
         holder = QWidget()
-        holder.setLayout(self.eq_grid)
+        holder.setLayout(self.eq_flow)
         sec.add(holder)
         return sec
 
@@ -485,11 +502,9 @@ class App(QWidget):
 
         self.bar_dot = QLabel("●")
         self.bar_dot.setObjectName("dot")
-        self.bar_name = QLabel("未连接")
-        self.bar_name.setObjectName("barname")
-        self.bar_name.setMinimumWidth(52)
+        self.bar_name = MarqueeLabel(self.p)
+        self.bar_name.setText("未连接")
         self.bar_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._bar_full_name = "未连接"
 
         self.btn_bar_anc = QPushButton("降噪 —")
         self.btn_bar_anc.setObjectName("pillMini")
@@ -520,6 +535,20 @@ class App(QWidget):
         self.btn_expand.setCursor(Qt.PointingHandCursor)
         self.btn_expand.clicked.connect(self.toggle_compact)
 
+        self.btn_bar_pin = QPushButton("📌")
+        self.btn_bar_pin.setObjectName("icon")
+        self.btn_bar_pin.setCheckable(True)
+        self.btn_bar_pin.setToolTip("窗口置顶")
+        self.btn_bar_pin.setCursor(Qt.PointingHandCursor)
+        self.btn_bar_pin.clicked.connect(self.toggle_pin)
+
+        self.btn_bar_log = QPushButton("📝")
+        self.btn_bar_log.setObjectName("icon")
+        self.btn_bar_log.setCheckable(True)
+        self.btn_bar_log.setToolTip("记录详细协议日志")
+        self.btn_bar_log.setCursor(Qt.PointingHandCursor)
+        self.btn_bar_log.toggled.connect(self.set_verbose)
+
         self.btn_bar_close = QPushButton("✕")
         self.btn_bar_close.setObjectName("icon")
         self.btn_bar_close.setCursor(Qt.PointingHandCursor)
@@ -529,38 +558,40 @@ class App(QWidget):
         row.addWidget(self.bar_name, 1)
         row.addWidget(self.btn_bar_anc)
         row.addWidget(self.bar_batt)
-        row.addWidget(self.btn_bar_game)
-        row.addWidget(self.btn_bar_find)
-        row.addWidget(self.btn_expand)
-        row.addWidget(self.btn_bar_close)
+        for b in (self.btn_bar_game, self.btn_bar_find, self.btn_bar_pin,
+                  self.btn_bar_log, self.btn_expand, self.btn_bar_close):
+            b.setFixedSize(26, 26)
+            row.addWidget(b)
         return w
 
     def _bar_width(self) -> int:
         extra = int(self.bar_items["game"]) + int(self.bar_items["find"])
-        return 470 + extra * 30
+        return 500 + extra * 28
 
     def toggle_compact(self):
         self.compact = not self.compact
         self.panel.setVisible(not self.compact)
         self.bar.setVisible(self.compact)
         if self.compact:
-            # 隐藏的面板仍会撑最小高度，必须改成 Ignored 才能压成一条
-            self.panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+            self._normal_size = self.size()
+            self.scroll.setVisible(False)
+            self.grip.setVisible(False)
             self.setFixedSize(self._bar_width(), 58)
             self._sync_bar()
         else:
-            self.panel.setSizePolicy(QSizePolicy.Preferred,
-                                     QSizePolicy.Preferred)
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
-            self.setFixedWidth(432)
-            self._fit_panel()
+            self.scroll.setVisible(True)
+            self.grip.setVisible(True)
+            self.setMinimumSize(430, 320)
+            self.setMaximumSize(16777215, 16777215)
+            self.resize(self._normal_size or QSize(468, 800))
         self._save_settings()
 
     def _fit_panel(self):
-        """按内容高度重排（收起分区后不留大片空白）。"""
-        self.panel.adjustSize()
-        self.resize(self.width(), max(430, self.panel.sizeHint().height()))
+        """窗口尺寸交给用户控制，这里只保证不低于最小尺寸。"""
+        if self.compact:
+            return
+        h = max(self.minimumHeight(), min(self.height(), 2000))
+        self.resize(self.width(), h)
 
     def cycle_anc(self):
         """条状形态：文字按钮，点一下切到下一档。"""
@@ -577,10 +608,9 @@ class App(QWidget):
         """把连接状态与当前档位同步到条状形态。"""
         if not hasattr(self, "btn_bar_anc"):
             return
-        name = self.lbl_title.text() if self.lbl_state.text().startswith("已连接") else "未连接"
-        self._bar_full_name = name
-        # 布局还没落位，等一帧再按真实宽度省略
-        QTimer.singleShot(0, self._elide_bar_name)
+        connected = self.lbl_state.text().startswith("已连接")
+        name = self._full_name if connected else "未连接"
+        self.bar_name.setText(name)
         self.bar_name.setToolTip(name)
         self.bar_dot.setProperty("on", name != "未连接")
         self.bar_dot.style().unpolish(self.bar_dot)
@@ -598,14 +628,7 @@ class App(QWidget):
         self.btn_bar_find.setVisible(self.bar_items["find"] and self.profile.find)
 
     def _elide_bar_name(self):
-        from PySide6.QtGui import QFontMetrics
-        w = max(40, self.bar_name.width() - 6)
-        self.bar_name.setText(QFontMetrics(self.bar_name.font()).elidedText(
-            self._bar_full_name, Qt.ElideRight, w))
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        QTimer.singleShot(0, self._elide_bar_name)
+        """保留接口：现在由 MarqueeLabel 负责滚动显示。"""
 
     def on_bar_game(self, on: bool):
         if self.sw_game.isChecked() != on:
@@ -646,6 +669,11 @@ class App(QWidget):
 
     def set_verbose(self, on: bool):
         self.verbose = on
+        for b in (getattr(self, "btn_bar_log", None),):
+            if b is not None and b.isChecked() != on:
+                b.blockSignals(True)
+                b.setChecked(on)
+                b.blockSignals(False)
         logs.set_verbose(on)
         logs.get("app").info("详细协议日志 %s", "开启" if on else "关闭")
         self._save_settings()
@@ -673,6 +701,10 @@ class App(QWidget):
             self.bar_items[key] = st.value(f"bar/{key}",
                                            self.bar_items[key], type=bool)
         logs.setup(self.verbose)
+        if hasattr(self, "btn_bar_log"):
+            self.btn_bar_log.blockSignals(True)
+            self.btn_bar_log.setChecked(self.verbose)
+            self.btn_bar_log.blockSignals(False)
 
     def _save_settings(self):
         st = self.settings
@@ -692,6 +724,8 @@ class App(QWidget):
         for r in (self.ring_l, self.ring_r, self.ring_c):
             r.p = self.p
             r.update()
+        self.bar_name.set_palette(self.p)
+        self.lbl_title.set_palette(self.p)
         for sw in (self.sw_game,):
             sw.p = self.p
             sw.update()
@@ -701,28 +735,108 @@ class App(QWidget):
             self.bar_dot.style().polish(self.bar_dot)
 
     def toggle_pin(self):
-        on = self.btn_pin.isChecked()
+        # 面板与条状各有一个置顶按钮，以触发者为准
+        src = self.sender()
+        if src is self.btn_bar_pin:
+            on = self.btn_bar_pin.isChecked()
+        else:
+            on = self.btn_pin.isChecked()
+        for b in (self.btn_pin, self.btn_bar_pin):
+            b.blockSignals(True)
+            b.setChecked(on)
+            b.blockSignals(False)
         geo = self.geometry()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
         self.show()          # 改窗口标志后必须重新 show 才会生效
         self.setGeometry(geo)
         self.btn_pin.setText("📍" if on else "📌")
+        self.btn_bar_pin.setText("📍" if on else "📌")
+        self.settings.setValue("pinned", on)
 
     def toggle_theme(self):
         self.dark = not self.dark
         self.apply_theme()
 
-    # ---- 无边框拖动 ----------------------------------------------------------
+    # ---- 无边框：拖动 / 边缘缩放 ---------------------------------------------
+    EDGE = 7
+
+    def _edge_at(self, pos) -> str:
+        if self.compact:
+            return ""
+        x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
+        left, right = x <= self.EDGE, x >= w - self.EDGE
+        top, bottom = y <= self.EDGE, y >= h - self.EDGE
+        if top and left:
+            return "tl"
+        if top and right:
+            return "tr"
+        if bottom and left:
+            return "bl"
+        if bottom and right:
+            return "br"
+        if left:
+            return "l"
+        if right:
+            return "r"
+        if top:
+            return "t"
+        if bottom:
+            return "b"
+        return ""
+
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton and e.position().y() < 64:
+        if e.button() != Qt.LeftButton:
+            return
+        edge = self._edge_at(e.position().toPoint())
+        if edge:
+            self._resize_edge = edge
+            self._resize_start = (e.globalPosition().toPoint(), self.geometry())
+            return
+        if e.position().y() < 64:
             self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e):
+        if self._resize_edge and self._resize_start:
+            gp = e.globalPosition().toPoint()
+            origin, geo = self._resize_start
+            dx, dy = gp.x() - origin.x(), gp.y() - origin.y()
+            g = QRect(geo)
+            if "l" in self._resize_edge:
+                g.setLeft(min(geo.left() + dx, geo.right() - self.minimumWidth()))
+            if "r" in self._resize_edge:
+                g.setRight(max(geo.right() + dx, geo.left() + self.minimumWidth()))
+            if "t" in self._resize_edge:
+                g.setTop(min(geo.top() + dy, geo.bottom() - self.minimumHeight()))
+            if "b" in self._resize_edge:
+                g.setBottom(max(geo.bottom() + dy, geo.top() + self.minimumHeight()))
+            self.setGeometry(g)
+            return
         if self._drag is not None and e.buttons() & Qt.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag)
+        else:
+            self._update_cursor(e.position().toPoint())
+
+    def _update_cursor(self, pos):
+        edge = self._edge_at(pos)
+        cursors = {"l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+                   "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+                   "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+                   "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor}
+        self.setCursor(cursors.get(edge, Qt.ArrowCursor))
 
     def mouseReleaseEvent(self, _e):
+        if self._resize_edge:
+            self._resize_edge = ""
+            self._resize_start = None
+            self._save_settings()
+            self.settings.setValue("geometry", self.saveGeometry())
         self._drag = None
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "grip"):
+            self.grip.move(self.root.width() - 18, self.root.height() - 18)
+        QTimer.singleShot(0, self._elide_bar_name)
 
     # ---- 设备 ---------------------------------------------------------------
     def refresh_devices(self):
@@ -776,11 +890,12 @@ class App(QWidget):
             if self.worker:
                 self.worker.fast_anc = self.profile.fast_anc
                 self.worker.game_features = self.profile.game_features
-            from PySide6.QtGui import QFontMetrics
+            self._full_name = self.profile.name
+            self._title_full = self.profile.name
             self.lbl_title.setToolTip(self.profile.name)
-            self.lbl_title.setText(QFontMetrics(self.lbl_title.font()).elidedText(
-                self.profile.name, Qt.ElideRight, 232))
+            self.lbl_title.setText(self.profile.name)
             self.lbl_state.setText("已连接")
+            self.lbl_state.setToolTip(self.profile.name)
             self.lbl_pid.setText(f"产品 ID {data}" if data else "型号未知")
             self.btn_connect.setText("断开")
             self.btn_connect.setEnabled(True)
@@ -846,31 +961,23 @@ class App(QWidget):
 
     # ---- 控件重建 -----------------------------------------------------------
     def build_anc(self):
-        while self.anc_grid.count():
-            it = self.anc_grid.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+        self.anc_flow.clear()
         self.anc_buttons: dict[int, QPushButton] = {}
-        for i, a in enumerate(self.profile.anc):
+        for a in self.profile.anc:
             btn = QPushButton(a["label"])
             btn.setObjectName("pill")
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _=False, idx=a["index"]: self.on_anc(idx))
             self.anc_buttons[a["index"]] = btn
-            self.anc_grid.addWidget(btn, i // 4, i % 4)
-        for c in range(4):
-            self.anc_grid.setColumnStretch(c, 1)
+            self.anc_flow.addWidget(btn)
         if self._cur_mode is not None:
             self._check(self.anc_buttons, self._cur_mode)
         self._sync_bar()
 
     def build_eq(self, items: list[tuple[int, str, bool]], hint: str = ""):
         """items = [(eqId, 名称, 是否来自耳机目录)]，按 id 升序铺成芯片。"""
-        while self.eq_grid.count():
-            it = self.eq_grid.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+        self.eq_flow.clear()
         self.eq_buttons: dict[int, QPushButton] = {}
         seen: set[int] = set()
         for i, (eq_id, name, from_dev) in enumerate(sorted(items, key=lambda x: x[0])):
@@ -884,9 +991,7 @@ class App(QWidget):
             btn.setToolTip("耳机内预设（含自定义）" if from_dev else "内置预设")
             btn.clicked.connect(lambda _=False, k=eq_id: self.on_eq(k))
             self.eq_buttons[eq_id] = btn
-            self.eq_grid.addWidget(btn, i // 3, i % 3)
-            for c in range(3):
-                self.eq_grid.setColumnStretch(c, 1)
+            self.eq_flow.addWidget(btn)
         if hint:
             self.eq_hint.setText(hint)
 
@@ -996,7 +1101,7 @@ class App(QWidget):
                 parts.append(f"{cn}耳" + ("佩戴" if s.get("in_ear")
                                           else ("在盒" if s.get("in_case") else "在外")))
             if parts:
-                self.lbl_state.setText("已连接 · " + "，".join(parts))
+                self.lbl_state.setToolTip("佩戴：" + "，".join(parts))
         elif name == "game_mode" and ev.get("game") is not None:
             self.feature_state["game"] = bool(ev["game"].get("on"))
             self.set_switch_silent("game", self.feature_state["game"])
@@ -1015,9 +1120,9 @@ class App(QWidget):
         elif name == "connected_devices":
             devs = ev.get("devices") or []
             if devs:
-                self.lbl_state.setText(
-                    "已连接 · 双连 " + "、".join(d["name"] or d["address"]
-                                                 for d in devs))
+                self.lbl_state.setToolTip(
+                    "双连：" + "、".join(d["name"] or d["address"]
+                                        for d in devs))
 
     # ---- 演示 ---------------------------------------------------------------
     def adjust_height(self):
@@ -1033,7 +1138,7 @@ class App(QWidget):
         self._check(self.anc_buttons, 4)
         self._check(self.eq_buttons, 3)
         self.lbl_fw.setText("固件  左 118 · 右 118 · 盒 105")
-        self.lbl_state.setText("已连接 · 演示数据")
+        self.lbl_state.setText("已连接")
         self._cur_mode = 4
         self._sync_bar()
         self.sw_game.blockSignals(True)
@@ -1041,6 +1146,9 @@ class App(QWidget):
         self.sw_game.blockSignals(False)
 
     def closeEvent(self, e):
+        self._save_settings()
+        if not self.compact:            # 条状尺寸不复用
+            self.settings.setValue("geometry", self.saveGeometry())
         if self.worker:
             self.worker.stop_flag.set()
         super().closeEvent(e)
