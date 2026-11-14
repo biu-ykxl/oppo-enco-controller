@@ -22,7 +22,7 @@ from PySide6.QtCore import QPoint, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMenu, QMessageBox, QPushButton, QVBoxLayout, QWidget)
+    QMenu, QMessageBox, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 from oppo import audioinfo, btwin, logs
 from oppo.devices import (GENERIC, looks_like_supported,
@@ -456,13 +456,17 @@ class App(QWidget):
         self.bar_dot.setObjectName("dot")
         self.bar_name = QLabel("未连接")
         self.bar_name.setObjectName("barname")
-        self.bar_name.setFixedWidth(108)
+        self.bar_name.setMinimumWidth(52)
+        self.bar_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._bar_full_name = "未连接"
 
-        self.btn_bar_anc = QPushButton("降噪 —")
+        self.bar_anc_menu = QMenu(self)
+        self.btn_bar_anc = QPushButton("降噪 ▾")
         self.btn_bar_anc.setObjectName("pillMini")
+        self.btn_bar_anc.setFixedWidth(104)
         self.btn_bar_anc.setCursor(Qt.PointingHandCursor)
-        self.btn_bar_anc.setToolTip("点击循环切换降噪模式")
-        self.btn_bar_anc.clicked.connect(self.cycle_anc)
+        self.btn_bar_anc.setToolTip("选择降噪模式")
+        self.btn_bar_anc.clicked.connect(self.open_anc_menu)
 
         self.bar_batt = QLabel("")
         self.bar_batt.setObjectName("battmini")
@@ -492,8 +496,8 @@ class App(QWidget):
         self.btn_bar_close.clicked.connect(self.close)
 
         row.addWidget(self.bar_dot)
-        row.addWidget(self.bar_name)
-        row.addWidget(self.btn_bar_anc, 1)
+        row.addWidget(self.bar_name, 1)
+        row.addWidget(self.btn_bar_anc)
         row.addWidget(self.bar_batt)
         row.addWidget(self.btn_bar_game)
         row.addWidget(self.btn_bar_find)
@@ -501,15 +505,24 @@ class App(QWidget):
         row.addWidget(self.btn_bar_close)
         return w
 
+    def _bar_width(self) -> int:
+        extra = int(self.bar_items["game"]) + int(self.bar_items["find"])
+        return 470 + extra * 30
+
     def toggle_compact(self):
         self.compact = not self.compact
         self.panel.setVisible(not self.compact)
         self.bar.setVisible(self.compact)
         if self.compact:
-            self.setFixedWidth(470)     # 条状比面板稍宽，够放降噪+电量
-            self.resize(470, 58)
+            # 隐藏的面板仍会撑最小高度，必须改成 Ignored 才能压成一条
+            self.panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+            self.setFixedSize(self._bar_width(), 58)
             self._sync_bar()
         else:
+            self.panel.setSizePolicy(QSizePolicy.Preferred,
+                                     QSizePolicy.Preferred)
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
             self.setFixedWidth(432)
             self._fit_panel()
         self._save_settings()
@@ -518,45 +531,58 @@ class App(QWidget):
         self.panel.adjustSize()
         self.resize(self.width(), max(660, self.panel.sizeHint().height()))
 
-    def cycle_anc(self):
-        """条状形态：一个按钮轮流切换降噪档位。"""
-        modes = [m["index"] for m in self.profile.anc]
-        if not modes:
+    def open_anc_menu(self):
+        """条状形态：点降噪按钮弹出下拉，直接选档位。"""
+        if not self.profile.anc:
             return
-        try:
-            i = modes.index(self._cur_mode)
-        except ValueError:
-            i = -1
-        nxt = modes[(i + 1) % len(modes)]
-        self.on_anc(nxt)
+        self._rebuild_anc_menu()
+        self.bar_anc_menu.exec(
+            self.btn_bar_anc.mapToGlobal(
+                self.btn_bar_anc.rect().bottomLeft()))
+
+    def _rebuild_anc_menu(self):
+        m = self.bar_anc_menu
+        m.clear()
+        for a in self.profile.anc:
+            act = QAction(a["label"], self)
+            act.setCheckable(True)
+            act.setChecked(a["index"] == self._cur_mode)
+            act.triggered.connect(lambda _=False, i=a["index"]: self.on_anc(i))
+            m.addAction(act)
 
     def _sync_bar(self):
         """把连接状态与当前档位同步到条状形态。"""
         if not hasattr(self, "btn_bar_anc"):
             return
         name = self.lbl_title.text() if self.lbl_state.text().startswith("已连接") else "未连接"
-        # 右侧图标越少，名字留的空间越大
-        extra_icons = int(self.bar_items["game"]) + int(self.bar_items["find"])
-        avail = 150 - extra_icons * 28
-        self.bar_name.setFixedWidth(avail)
-        from PySide6.QtGui import QFontMetrics
-        self.bar_name.setText(QFontMetrics(self.bar_name.font()).elidedText(
-            name, Qt.ElideRight, avail - 4))
+        self._bar_full_name = name
+        # 布局还没落位，等一帧再按真实宽度省略
+        QTimer.singleShot(0, self._elide_bar_name)
         self.bar_name.setToolTip(name)
         self.bar_dot.setProperty("on", name != "未连接")
         self.bar_dot.style().unpolish(self.bar_dot)
         self.bar_dot.style().polish(self.bar_dot)
         if self._cur_mode is not None:
             label = self.profile.anc_label(self._cur_mode)
-            self.btn_bar_anc.setText(label)
-            self.btn_bar_anc.setToolTip(f"降噪：{label}（点击切换下一档）")
+            self.btn_bar_anc.setText(label + " ▾")
+            self.btn_bar_anc.setToolTip(f"降噪：{label}（点击选择）")
         else:
-            self.btn_bar_anc.setText("降噪 —")
-            self.btn_bar_anc.setToolTip("点击切换降噪模式")
+            self.btn_bar_anc.setText("降噪 ▾")
+            self.btn_bar_anc.setToolTip("点击选择降噪模式")
         self.btn_bar_anc.setVisible(self.bar_items["anc"])
         self.bar_batt.setVisible(self.bar_items["battery"])
         self.btn_bar_game.setVisible(self.bar_items["game"])
         self.btn_bar_find.setVisible(self.bar_items["find"] and self.profile.find)
+
+    def _elide_bar_name(self):
+        from PySide6.QtGui import QFontMetrics
+        w = max(40, self.bar_name.width() - 6)
+        self.bar_name.setText(QFontMetrics(self.bar_name.font()).elidedText(
+            self._bar_full_name, Qt.ElideRight, w))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        QTimer.singleShot(0, self._elide_bar_name)
 
     def on_bar_game(self, on: bool):
         if self.sw_game.isChecked() != on:
@@ -591,6 +617,8 @@ class App(QWidget):
     def set_bar_item(self, key: str, on: bool):
         self.bar_items[key] = on
         self._sync_bar()
+        if self.compact:
+            self.setFixedSize(self._bar_width(), 58)
         self._save_settings()
 
     def set_verbose(self, on: bool):

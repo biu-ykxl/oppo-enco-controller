@@ -113,6 +113,16 @@ def stylesheet(p: dict) -> str:
                                   color: {p['accent']}; }}
 
     QFrame#sep {{ background: {p['line']}; max-height: 1px; border: none; }}
+    QMenu {{
+        background: {p['card']}; color: {p['text']};
+        border: 1px solid {p['line']}; border-radius: 10px; padding: 6px;
+        font-size: 12px;
+    }}
+    QMenu::item {{ padding: 6px 26px 6px 12px; border-radius: 6px; }}
+    QMenu::item:selected {{ background: {p['hover']}; }}
+    QMenu::item:checked {{ color: {p['accent']}; font-weight: 600; }}
+    QMenu::separator {{ height: 1px; background: {p['line']}; margin: 5px 8px; }}
+
     QStatusBar {{ background: transparent; color: {p['sub']}; font-size: 11px; }}
     QStatusBar::item {{ border: none; }}
     """

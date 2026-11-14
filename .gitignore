@@ -1,6 +1,7 @@
 # 构建产物
 build/
 dist/
+dist_v15/
 *.spec.bak
 *.exe
 
