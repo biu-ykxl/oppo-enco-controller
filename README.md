@@ -5,7 +5,7 @@ Windows 上的 OPPO / OnePlus 真无线耳机控制台，**优先适配 OPPO Enc
 
 ![界面](docs/screenshot.png)
 
-绿色单文件 EXE，拷走即用，不需要 Python、不需要驱动。
+绿色单文件 EXE，拷走即用，不需要 Python、不需要驱动 → [下载最新版](https://github.com/biu-ykxl/oppo-enco-controller/releases/latest)
 
 ## 功能
 
