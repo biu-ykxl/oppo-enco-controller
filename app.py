@@ -30,7 +30,8 @@ from oppo.devices import (GENERIC, looks_like_supported,
 from oppo.protocol import (FEATURE_GAME_MODE, FEATURE_HIGH_QUALITY,
                            HQ_OFF, HQ_ON)
 from oppo.transport import Buds, TransportError
-from oppo.ui import BatteryRing, SectionTitle, Toggle, palette, stylesheet
+from oppo.ui import (BatteryRing, Collapsible, SectionTitle, Toggle,
+                     palette, stylesheet)
 
 APP_NAME = "OPPO Enco"
 APP_VERSION = "v1.3.0"
@@ -56,6 +57,7 @@ class BudsWorker(threading.Thread):
         self.bridge.hide()
         self.product_id: str | None = None
         self.fast_anc = False        # Air 系列等：跳过回读校验
+        self.game_features: tuple[int, ...] = (0x06,)
         self._cmd_lock = threading.Lock()
 
     def post(self, fn):
@@ -173,6 +175,29 @@ class BudsWorker(threading.Thread):
 
     def eq_refresh(self):
         self.post(lambda b: self._emit("eq_catalog", b.eq_catalog()))
+
+    def game_set(self, on: bool):
+        """游戏模式：不同品牌/型号 feature id 不同（OPPO 0x06，部分 realme 0x08）。"""
+        def _do(b):
+            ok = False
+            for fid in (self.game_features or (0x06,)):
+                fs = b.set_feature(fid, 1 if on else 0)
+                if (not fs) or fs[0]["payload"][:1] == b"\x00":
+                    ok = True
+                    break
+            self._emit("feature_ack", {"topic": "game", "on": on, "ok": ok})
+        self.post(_do)
+
+    def sync_feature_states(self):
+        """读回游戏模式/高清音频状态（realme 支持 0x010D 01 <id>）。"""
+        def _do(b):
+            for fid, topic in ((self.game_features[0] if self.game_features
+                                else 0x06, "game"),
+                               (FEATURE_HIGH_QUALITY, "hq")):
+                st = b.feature_state(fid)
+                if st is not None:
+                    self._emit("feature_state", {"topic": topic, "on": bool(st)})
+        self.post(_do)
 
     def feature_set(self, fid: int, value: int, on: bool, topic: str):
         def _do(b):
@@ -334,39 +359,45 @@ class App(QWidget):
         row.addStretch(1)
         return row
 
+    def _section(self, key: str, title: str, action: str | None = None):
+        """建一个可收起分区，收起状态按 key 记忆。"""
+        sec = Collapsible(title, self.p, action)
+        if self.settings.value(f"collapse/{key}", False, type=bool):
+            sec.set_collapsed(True, notify=False)
+        def _remember(on: bool, k: str = key):
+            self.settings.setValue(f"collapse/{k}", on)
+            if not self.compact:
+                # 布局刷新后才量得准，稍等再重排
+                QTimer.singleShot(80, self._fit_panel)
+        sec.toggled.connect(_remember)
+        setattr(self, f"sec_{key}", sec)
+        return sec
+
     def _build_anc(self):
-        w = QWidget()
-        box = QVBoxLayout(w)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(8)
-        box.addWidget(SectionTitle("降噪", self.p))
+        sec = self._section("anc", "降噪")
         self.anc_grid = QGridLayout()
         self.anc_grid.setSpacing(6)
-        box.addLayout(self.anc_grid)
-        return w
+        holder = QWidget()
+        holder.setLayout(self.anc_grid)
+        sec.add(holder)
+        return sec
 
     def _build_eq(self):
-        w = QWidget()
-        box = QVBoxLayout(w)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(8)
-        self.eq_title = SectionTitle("音效", self.p, action="⟳")
-        self.eq_title.clicked.connect(self.refresh_eq)
-        box.addWidget(self.eq_title)
+        sec = self._section("eq", "音效", action="⟳")
+        sec.btn_action.clicked.connect(self.refresh_eq)
         self.eq_hint = QLabel("连接后自动读取耳机内置与自定义预设")
         self.eq_hint.setObjectName("sub")
-        box.addWidget(self.eq_hint)
+        sec.add(self.eq_hint)
         self.eq_grid = QGridLayout()
         self.eq_grid.setSpacing(6)
-        box.addLayout(self.eq_grid)
-        return w
+        holder = QWidget()
+        holder.setLayout(self.eq_grid)
+        sec.add(holder)
+        return sec
 
     def _build_audio(self):
-        w = QWidget()
-        box = QVBoxLayout(w)
-        box.setContentsMargins(0, 0, 0, 0)
+        box = self._section("audio", "音频 · Hi-Res").body_lay
         box.setSpacing(8)
-        box.addWidget(SectionTitle("音频 · Hi-Res", self.p))
 
         # 设备侧只有两档：标准(0x18=0) / Hi-Res(0x18=2)
         row = QHBoxLayout()
@@ -392,7 +423,7 @@ class App(QWidget):
         note.setObjectName("sub")
         note.setWordWrap(True)
         box.addWidget(note)
-        return w
+        return self.sec_audio
 
     def _build_features(self):
         w = QWidget()
@@ -460,13 +491,12 @@ class App(QWidget):
         self.bar_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._bar_full_name = "未连接"
 
-        self.bar_anc_menu = QMenu(self)
-        self.btn_bar_anc = QPushButton("降噪 ▾")
+        self.btn_bar_anc = QPushButton("降噪 —")
         self.btn_bar_anc.setObjectName("pillMini")
         self.btn_bar_anc.setFixedWidth(104)
         self.btn_bar_anc.setCursor(Qt.PointingHandCursor)
-        self.btn_bar_anc.setToolTip("选择降噪模式")
-        self.btn_bar_anc.clicked.connect(self.open_anc_menu)
+        self.btn_bar_anc.setToolTip("点击切换降噪模式")
+        self.btn_bar_anc.clicked.connect(self.cycle_anc)
 
         self.bar_batt = QLabel("")
         self.bar_batt.setObjectName("battmini")
@@ -528,27 +558,20 @@ class App(QWidget):
         self._save_settings()
 
     def _fit_panel(self):
+        """按内容高度重排（收起分区后不留大片空白）。"""
         self.panel.adjustSize()
-        self.resize(self.width(), max(660, self.panel.sizeHint().height()))
+        self.resize(self.width(), max(430, self.panel.sizeHint().height()))
 
-    def open_anc_menu(self):
-        """条状形态：点降噪按钮弹出下拉，直接选档位。"""
-        if not self.profile.anc:
+    def cycle_anc(self):
+        """条状形态：文字按钮，点一下切到下一档。"""
+        modes = [m["index"] for m in self.profile.anc]
+        if not modes:
             return
-        self._rebuild_anc_menu()
-        self.bar_anc_menu.exec(
-            self.btn_bar_anc.mapToGlobal(
-                self.btn_bar_anc.rect().bottomLeft()))
-
-    def _rebuild_anc_menu(self):
-        m = self.bar_anc_menu
-        m.clear()
-        for a in self.profile.anc:
-            act = QAction(a["label"], self)
-            act.setCheckable(True)
-            act.setChecked(a["index"] == self._cur_mode)
-            act.triggered.connect(lambda _=False, i=a["index"]: self.on_anc(i))
-            m.addAction(act)
+        try:
+            i = modes.index(self._cur_mode)
+        except ValueError:
+            i = -1
+        self.on_anc(modes[(i + 1) % len(modes)])
 
     def _sync_bar(self):
         """把连接状态与当前档位同步到条状形态。"""
@@ -564,11 +587,11 @@ class App(QWidget):
         self.bar_dot.style().polish(self.bar_dot)
         if self._cur_mode is not None:
             label = self.profile.anc_label(self._cur_mode)
-            self.btn_bar_anc.setText(label + " ▾")
-            self.btn_bar_anc.setToolTip(f"降噪：{label}（点击选择）")
+            self.btn_bar_anc.setText(label)
+            self.btn_bar_anc.setToolTip(f"降噪：{label}（点击切换下一档）")
         else:
-            self.btn_bar_anc.setText("降噪 ▾")
-            self.btn_bar_anc.setToolTip("点击选择降噪模式")
+            self.btn_bar_anc.setText("降噪 —")
+            self.btn_bar_anc.setToolTip("点击切换降噪模式")
         self.btn_bar_anc.setVisible(self.bar_items["anc"])
         self.bar_batt.setVisible(self.bar_items["battery"])
         self.btn_bar_game.setVisible(self.bar_items["game"])
@@ -752,7 +775,11 @@ class App(QWidget):
             self.profile = profile_by_product_id(data or None, bt_name)
             if self.worker:
                 self.worker.fast_anc = self.profile.fast_anc
-            self.lbl_title.setText(self.profile.name)
+                self.worker.game_features = self.profile.game_features
+            from PySide6.QtGui import QFontMetrics
+            self.lbl_title.setToolTip(self.profile.name)
+            self.lbl_title.setText(QFontMetrics(self.lbl_title.font()).elidedText(
+                self.profile.name, Qt.ElideRight, 232))
             self.lbl_state.setText("已连接")
             self.lbl_pid.setText(f"产品 ID {data}" if data else "型号未知")
             self.btn_connect.setText("断开")
@@ -761,6 +788,9 @@ class App(QWidget):
             self.build_eq(self.eq_items_builtin())
             self.refresh_codec_info()
             self._sync_bar()
+            if self.worker:
+                threading.Thread(target=self.worker.sync_feature_states,
+                                 daemon=True).start()
             self.adjust_height()
         elif topic == "disconnected":
             self.btn_connect.setText("连接")
@@ -785,6 +815,14 @@ class App(QWidget):
                 self.build_eq(items, f"已读取 {n_dev} 个耳机内预设，内置预设同步可用")
             else:
                 self.eq_hint.setText("设备未返回 EQ 目录，显示内置预设")
+        elif topic == "feature_state":
+            if data["topic"] == "game":
+                self.feature_state["game"] = data["on"]
+                self.set_switch_silent("game", data["on"])
+            elif data["topic"] == "hq":
+                self.feature_state["hq"] = data["on"]
+                self._check(self.tier_buttons,
+                            HQ_ON if data["on"] else HQ_OFF)
         elif topic == "feature_ack":
             if not data.get("ok"):
                 if data["topic"] == "hq":
@@ -906,7 +944,7 @@ class App(QWidget):
         if not self.worker:
             return
         if key == "game":
-            self.worker.feature_set(FEATURE_GAME_MODE, 1 if on else 0, on, "game")
+            self.worker.game_set(on)
         elif key == "hq":
             # 高清音频/码率：设备用 2 表示开、0 表示关（发 1 会被拒）
             self.worker.feature_set(FEATURE_HIGH_QUALITY,

@@ -38,6 +38,19 @@ EQ_FREE4 = [
     {"index": 1, "label": "纯享人声"},
     {"index": 2, "label": "澎湃低音"},
 ]
+# realme（realme Link，T310/T300 抓包）：位图值 0x01=普通、0x02=通透、0x08=降噪
+ANC_REALME = [
+    {"index": 0, "group": "off", "label": "普通"},
+    {"index": 1, "group": "transparency", "label": "通透"},
+    {"index": 3, "group": "nc", "label": "降噪"},
+]
+EQ_REALME = [
+    {"index": 0, "label": "均衡"},
+    {"index": 1, "label": "低音增强"},
+    {"index": 2, "label": "清晰"},
+    {"index": 3, "label": "纯低音"},
+]
+
 EQ_GENERIC = [
     {"index": 0, "label": "原音"},
     {"index": 1, "label": "低音"},
@@ -69,7 +82,8 @@ class DeviceProfile:
     def __init__(self, product_id: str, name: str, anc: list, eq: list,
                  game_mode: bool = True, find: bool = True,
                  wear_detect: bool = True, multi_connect: bool = True,
-                 fast_anc: bool = False):
+                 fast_anc: bool = False, brand: str = "oppo",
+                 game_features: tuple[int, ...] = (0x06,)):
         self.product_id = product_id
         self.name = name
         self.anc = anc
@@ -81,6 +95,9 @@ class DeviceProfile:
         self.multi_connect = multi_connect
         # Air 系列等固件对降噪写命令响应慢：跳过回读校验，乐观更新
         self.fast_anc = fast_anc
+        self.brand = brand
+        # 不同品牌/型号的游戏模式 feature id 不同，按顺序试
+        self.game_features = game_features
 
     def anc_label(self, index: int) -> str:
         a = self.anc_by_index.get(index)
@@ -93,14 +110,16 @@ class DeviceProfile:
         clone = DeviceProfile(
             self.product_id, self.name, modes_from_indices(indices), self.eq,
             self.game_mode, self.find, self.wear_detect, self.multi_connect,
-            self.fast_anc)
+            self.fast_anc, self.brand, self.game_features)
         return clone
 
 
 GENERIC = DeviceProfile("000000", "OPPO / OnePlus / realme 耳机",
                         ANC_GENERIC, EQ_GENERIC, fast_anc=True)
-REALME = DeviceProfile("000001", "realme 耳机", ANC_GENERIC, EQ_GENERIC,
-                       fast_anc=True)
+# realme Link：游戏模式在 T310 上是 feature 0x06，T300 上是 0x08，两个都试
+REALME = DeviceProfile("000001", "realme 耳机", ANC_REALME, EQ_REALME,
+                       fast_anc=True, brand="realme",
+                       game_features=(0x06, 0x08))
 
 PROFILES: dict[str, DeviceProfile] = {}
 for _pid, _name, _anc, _eq, _find, _fast in [
@@ -127,7 +146,13 @@ def profile_by_product_id(pid: str | None,
         hit = PROFILES.get(pid.upper())
         if hit:
             return hit
-    if "realme" in (bt_name or "").lower():
+    low = (bt_name or "").lower()
+    # realme 的 ANC 位序与 OPPO 不同（3=降噪），错认会导致档位语义颠倒，
+    # 所以这里既要认 "realme"，也要认不带 OPPO/OnePlus 标记的 Buds 系列
+    if "realme" in low:
+        return REALME
+    if ("buds" in low or "dizo" in low) and "enco" not in low \
+            and "oneplus" not in low:
         return REALME
     return GENERIC
 

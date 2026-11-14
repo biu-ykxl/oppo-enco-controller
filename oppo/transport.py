@@ -10,7 +10,8 @@ import time
 
 from .logs import get as get_logger
 
-from .protocol import (CMD_ANC_QUERY, CMD_ANC_SET, CMD_BATT_GET, CMD_CAPS,
+from .protocol import (CMD_ANC_QUERY, CMD_ANC_SET, CMD_BATCH_STATUS,
+                       CMD_BATT_GET, CMD_CAPS,
                        CMD_EQ_ALL,
                        CMD_EQ_SET, CMD_FIND_SET, CMD_GESTURES_GET,
                        CMD_INFO, CMD_NOTIFY_PUSH, CMD_NOTIFY_REG,
@@ -228,6 +229,21 @@ class Buds:
     def set_eq(self, index: int) -> list[dict]:
         return self.send(CMD_EQ_SET, bytes([index & 0xFF]))
 
+    def feature_state(self, feature_id: int) -> int | None:
+        """读单个功能开关状态（0x010D payload 01 <id>，realme 文档确认）。
+
+        回复 `00 01 <id> <state>`；不支持时返回 None。
+        """
+        try:
+            for f in self.send(CMD_BATCH_STATUS, bytes([0x01, feature_id & 0xFF]),
+                               wait=1.0):
+                p = f["payload"]
+                if len(p) >= 4 and p[0] == 0:
+                    return p[3]
+        except (TransportError, OSError):
+            pass
+        return None
+
     def set_feature(self, feature_id: int, value: int | bool) -> list[dict]:
         """通用功能开关（0x0403）。
 
@@ -283,12 +299,18 @@ class Buds:
                 p = f["payload"]
                 if len(p) < 3:
                     continue
+                # status 非 0 = 设备不接受这个查询（Free4 返回 02 + 状态字节），
+                # 此时后面几个字节不是位图，必须丢弃，否则会解析出「模式 13」这类鬼档位
+                if p[0] != 0:
+                    LOG.info("设备不支持档位查询（status=0x%02X），回退型号档案", p[0])
+                    return []
                 out: list[int] = []
                 for i, byte in enumerate(p[2:]):
                     for bit in range(8):
                         if byte >> bit & 1:
                             out.append(i * 8 + bit)
-                if out:
+                out = [i for i in out if 0 <= i <= 11]
+                if out and len(out) <= 8:
                     LOG.info("设备声明降噪档位：%s",
                              ", ".join(f"{i}({MODE_LABELS.get(i, '?')})" for i in out))
                     return out

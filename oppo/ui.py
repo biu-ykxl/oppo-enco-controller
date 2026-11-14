@@ -9,7 +9,8 @@ from PySide6.QtCore import (QEasingCurve, QRectF, Qt, QVariantAnimation,
                             Signal)
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractButton, QHBoxLayout, QLabel,
-                               QPushButton, QSizePolicy, QWidget)
+                               QPushButton, QSizePolicy, QVBoxLayout,
+                               QWidget)
 
 DARK = {
     "bg": "#14161B", "card": "#1B1E25", "card2": "#22262F",
@@ -51,6 +52,11 @@ def stylesheet(p: dict) -> str:
     QLabel#chip {{ color: {p['sub']}; font-size: 11px; }}
     QLabel#chipTitle {{ color: {p['text']}; font-size: 12px; }}
 
+    QPushButton#chevron {{
+        background: transparent; border: none; color: {p['sub']};
+        font-size: 11px; padding: 0;
+    }}
+    QPushButton#chevron:hover {{ color: {p['text']}; }}
     QPushButton#icon {{
         background: transparent; border: none; color: {p['sub']};
         font-size: 15px; padding: 4px; border-radius: 8px;
@@ -292,3 +298,62 @@ class SectionTitle(QWidget):
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(self.clicked.emit)
             lay.addWidget(btn)
+
+
+class Collapsible(QWidget):
+    """可收起分区：标题行（箭头 + 标题 + 可选右侧按钮）+ 内容体。"""
+
+    toggled = Signal(bool)
+
+    def __init__(self, title: str, p: dict, action: str | None = None,
+                 parent=None):
+        super().__init__(parent)
+        self.p = p
+        self.collapsed = False
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(6)
+        self.btn_toggle = QPushButton("▾")
+        self.btn_toggle.setObjectName("chevron")
+        self.btn_toggle.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle.setFixedWidth(18)
+        self.btn_toggle.clicked.connect(self.toggle)
+        self.lbl = QLabel(title)
+        self.lbl.setObjectName("section")
+        self.lbl.setCursor(Qt.PointingHandCursor)
+        head.addWidget(self.btn_toggle)
+        head.addWidget(self.lbl)
+        head.addStretch(1)
+        self.btn_action = None
+        if action:
+            self.btn_action = QPushButton(action)
+            self.btn_action.setObjectName("icon")
+            self.btn_action.setCursor(Qt.PointingHandCursor)
+            head.addWidget(self.btn_action)
+        box.addLayout(head)
+
+        self.body = QWidget()
+        self.body_lay = QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(0, 0, 0, 0)
+        self.body_lay.setSpacing(6)
+        box.addWidget(self.body)
+
+        # 点标题也能收起
+        self.lbl.mousePressEvent = lambda _e: self.toggle()
+
+    def add(self, w):
+        self.body_lay.addWidget(w)
+
+    def toggle(self):
+        self.set_collapsed(not self.collapsed)
+
+    def set_collapsed(self, on: bool, notify: bool = True):
+        self.collapsed = on
+        self.body.setVisible(not on)
+        self.btn_toggle.setText("▸" if on else "▾")
+        if notify:
+            self.toggled.emit(on)
