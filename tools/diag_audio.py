@@ -1,4 +1,8 @@
-"""诊断：反复开关服务后，Windows 音频端点是否还能出现。"""
+"""诊断：耳机连上但没声音时，检查系统里是否还有它的音频端点。
+
+用法：把 A 改成耳机地址后运行  python tools/diag_audio.py
+背景见 docs/VERIFIED.md 第 11 节（停用 A2DP 服务会卸载音频端点）。
+"""
 import subprocess
 import sys
 import time
@@ -6,7 +10,7 @@ import time
 sys.path.insert(0, ".")
 from oppo import btwin
 
-A = "00:A4:1C:2A:D5:A7"
+A = "AA:BB:CC:DD:EE:FF"   # 换成自己的耳机地址
 A2DP = "{0000110B-0000-1000-8000-00805F9B34FB}"
 
 
